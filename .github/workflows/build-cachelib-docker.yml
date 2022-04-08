@@ -8,6 +8,9 @@ jobs:
     name: "CentOS/latest - Build CacheLib with all dependencies"
     runs-on: ubuntu-latest
     env:
+      REPO:           CacheLib
+      GITHUB_REPO:    igchor/CacheLib
+      CONTAINER_REG:  ghcr.io/igchor/CacheLib
       CONTAINER_REG_USER:   ${{ secrets.GH_CR_USER }}
       CONTAINER_REG_PASS:   ${{ secrets.GH_CR_PAT }}
       FORCE_IMAGE_ACTION:   ${{ secrets.FORCE_IMAGE_ACTION }}
