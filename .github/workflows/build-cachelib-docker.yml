@@ -1,14 +1,20 @@
-name: build-cachelib-centos-latest
+name: build-cachelib-docker
 on:
   push:
   pull_request:
     
 jobs:
-  build-cachelib-centos8-latest:
+  build-cachelib-docker:
     name: "CentOS/latest - Build CacheLib with all dependencies"
     runs-on: ubuntu-latest
-    # Docker container image name
-    container: "ghcr.io/igchor/cachelib-deps:streams8"
+    env:
+      CONTAINER_REG_USER:   ${{ secrets.GH_CR_USER }}
+      CONTAINER_REG_PASS:   ${{ secrets.GH_CR_PAT }}
+      FORCE_IMAGE_ACTION:   ${{ secrets.FORCE_IMAGE_ACTION }}
+      WORKDIR:              docker
+    strategy:
+      matrix:
+        CONFIG: ["OS=centos OS_VER=8streams PUSH_IMAGE=1"]
     steps:
       - name: "System Information"
         run: |
@@ -28,10 +34,9 @@ jobs:
           gcc -v
       - name: "checkout sources"
         uses: actions/checkout@v2
-      - name: "print workspace"
-        run: echo $GITHUB_WORKSPACE
-      - name: "build CacheLib using build script"
-        run: mkdir build && cd build && cmake ../cachelib -DBUILD_TESTS=ON -DCMAKE_INSTALL_PREFIX=/opt -DCMAKE_BUILD_TYPE=Debug && make install -j$(nproc)
-      - name: "run tests"
-        timeout-minutes: 60
-        run: cd /opt/tests && $GITHUB_WORKSPACE/run_tests.sh
+      
+      - name: Pull the image or rebuild and push it
+        run: cd $WORKDIR && ${{ matrix.CONFIG }} ./pull-or-rebuild-image.sh $FORCE_IMAGE_ACTION
+
+      - name: Run the build
+        run: cd $WORKDIR && ${{ matrix.CONFIG }} ./build.sh
