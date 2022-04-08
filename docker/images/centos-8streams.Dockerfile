@@ -9,5 +9,5 @@ vim \
 gdb \
 clang
 
-COPY ./install-cachelib-deps.sh ./install-cachelib-deps.sh
-RUN ./install-cachelib-deps.sh
+# COPY ./install-cachelib-deps.sh ./install-cachelib-deps.sh
+# RUN ./install-cachelib-deps.sh
