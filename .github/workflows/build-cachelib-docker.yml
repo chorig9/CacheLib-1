@@ -9,8 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPO:           cachelib
-      GITHUB_REPO:    pmem/CacheLib
-      CONTAINER_REG:  ghcr.io/pmem/cachelib
+      GITHUB_REPO:    chorig9/CacheLib-1
+      CONTAINER_REG:  ghcr.io/chorig9/cachelib
       CONTAINER_REG_USER:   ${{ secrets.GH_CR_USER }}
       CONTAINER_REG_PASS:   ${{ secrets.GH_CR_PAT }}
       FORCE_IMAGE_ACTION:   ${{ secrets.FORCE_IMAGE_ACTION }}
