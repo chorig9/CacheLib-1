@@ -61,7 +61,7 @@ function push_image {
 	# - not a pull_request event,
 	# - and PUSH_IMAGE flag was set for current build.
 	if [[ "${CI_REPO_SLUG}" == "${GITHUB_REPO}" \
-		&& (${CI_BRANCH} == develop || ${CI_BRANCH} == main) \
+		&& (${CI_BRANCH} == develop || ${CI_BRANCH} == test_auto2) \
 		&& ${CI_EVENT_TYPE} != "pull_request" \
 		&& ${PUSH_IMAGE} == "1" ]]
 	then
