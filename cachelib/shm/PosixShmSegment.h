@@ -22,8 +22,6 @@
 namespace facebook {
 namespace cachelib {
 
-constexpr int kInvalidFD = -1;
-
 /* This class lets you manage a posix shared memory segment identified by
  * name. This is very similar to the System V shared memory segment, except
  * that it allows for resizing of the segments on the fly. This can let the
@@ -94,12 +92,12 @@ class PosixShmSegment : public ShmBase {
   // @return true if the segment existed. false otherwise
   static bool removeByName(const std::string& name);
 
+  // returns the key type corresponding to the given name.
+  static std::string createKeyForName(const std::string& name) noexcept;
+
  private:
   static int createNewSegment(const std::string& name);
   static int getExisting(const std::string& name, const ShmSegmentOpts& opts);
-
-  // returns the key type corresponding to the given name.
-  static std::string createKeyForName(const std::string& name) noexcept;
 
   // resize the segment
   // @param size  the new size

@@ -42,7 +42,7 @@ namespace cachebench {
 // Items value in this cache follows CacheValue schema, which
 // contains a few integers for sanity checks use. So it is invalid
 // to use item.getMemory and item.getSize APIs directly and caller must use
-// the getMemory() and getWriteableMemory() through this cache instance.
+// getMemory() through this cache instance.
 template <typename Allocator>
 class Cache {
  public:
@@ -135,17 +135,22 @@ class Cache {
     return cache_->viewAsChainedAllocs(std::forward<Params>(args)...);
   }
 
+  template <typename... Params>
+  auto viewAsWritableChainedAllocs(Params&&... args) {
+    return cache_->viewAsWritableChainedAllocs(std::forward<Params>(args)...);
+  }
+
   // Item specific accessors for the cache. This is needed since cachebench's
   // cache adds some overheads on top of Cache::Item.
 
   // Return the readonly memory
-  const void* getMemory(const ItemHandle& item) const noexcept {
-    return item == nullptr ? nullptr : getMemory(*item);
+  const void* getMemory(const ItemHandle& handle) const noexcept {
+    return handle == nullptr ? nullptr : getMemory(*handle);
   }
 
   // Return the writable memory
-  void* getWritableMemory(ItemHandle& item) const noexcept {
-    return item == nullptr ? nullptr : getWritableMemory(*item);
+  void* getMemory(ItemHandle& handle) noexcept {
+    return handle == nullptr ? nullptr : getMemory(*handle);
   }
 
   // Return the readonly memory
@@ -154,14 +159,17 @@ class Cache {
   }
 
   // Return the writable memory
-  void* getWritableMemory(Item& item) const noexcept {
-    return item.template getWritableMemoryAs<CacheValue>()->getWritableData();
+  void* getMemory(Item& item) noexcept {
+    return item.template getMemoryAs<CacheValue>()->getData();
   }
 
   // return the allocation size for the item.
   uint32_t getSize(const ItemHandle& item) const noexcept {
     return getSize(item.get());
   }
+
+  // checks if values stored in it matches expectedValue_.
+  void validateValue(const ItemHandle &it) const;
 
   // returns the size of the item, taking into account ItemRecords could be
   // enabled.
@@ -179,7 +187,7 @@ class Cache {
   //
   // @param handle   the handle for the item
   // @param str      the string value to be set.
-  void setStringItem(ItemHandle& handle, const std::string& str) const;
+  void setStringItem(ItemHandle& handle, const std::string& str);
 
   // when item records are enabled, updates the version for the item and
   // correspondingly invalidates the nvm cache.
@@ -220,8 +228,14 @@ class Cache {
   // @param keys  list of keys that the stressor uses for the workload.
   void enableConsistencyCheck(const std::vector<std::string>& keys);
 
+  // enables validating all values on find. Each value is compared to
+  // expected Value.
+  void enableValueValidating(const std::string &expectedValue);
+
   // returns true if the consistency checking is enabled.
   bool consistencyCheckEnabled() const { return valueTracker_ != nullptr; }
+
+  bool valueValidatingEnabled() const { return expectedValue_.has_value(); }
 
   // return true if the key was previously detected to be inconsistent. This
   // is useful only when consistency checking is enabled by calling
@@ -268,7 +282,7 @@ class Cache {
 
   // empties the cache entries by removing the keys, this will schedule the
   // destructor call backs to be executed.
-  void clearCache();
+  void clearCache(uint64_t errorLimit);
 
   // shuts down the cache for persistence. User shall not access the instance
   // until the cache is re-attached using reAttach() below.
@@ -344,6 +358,9 @@ class Cache {
 
   // tracker for consistency monitoring.
   std::unique_ptr<ValueTracker> valueTracker_;
+
+  // exceptected value of all items in Cache.
+  std::optional<std::string> expectedValue_;
 
   // reading of the nand bytes written for the benchmark if enabled.
   const uint64_t nandBytesBegin_{0};

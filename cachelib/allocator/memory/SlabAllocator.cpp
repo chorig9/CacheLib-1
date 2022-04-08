@@ -29,6 +29,14 @@
 
 #include "cachelib/common/Utils.h"
 
+/* Missing madvise(2) flags on MacOS */
+#ifndef MADV_REMOVE
+#define MADV_REMOVE 0
+#endif
+#ifndef MADV_DONTDUMP
+#define MADV_DONTDUMP 0
+#endif
+
 using namespace facebook::cachelib;
 
 namespace {
@@ -519,6 +527,8 @@ serialization::SlabAllocatorObject SlabAllocator::saveState() {
 // for benchmarking purposes.
 const unsigned int kMarkerBits = 6;
 CompressedPtr SlabAllocator::compressAlt(const void* ptr) const {
+  // XXX: do we need to set tierId here?
+
   if (ptr == nullptr) {
     return CompressedPtr{};
   }
@@ -530,6 +540,8 @@ CompressedPtr SlabAllocator::compressAlt(const void* ptr) const {
 }
 
 void* SlabAllocator::unCompressAlt(const CompressedPtr cPtr) const {
+  // XXX: do we need to set tierId here?
+
   if (cPtr.isNull()) {
     return nullptr;
   }

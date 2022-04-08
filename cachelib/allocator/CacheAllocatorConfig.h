@@ -25,6 +25,7 @@
 #include <string>
 
 #include "cachelib/allocator/Cache.h"
+#include "cachelib/allocator/MemoryTierCacheConfig.h"
 #include "cachelib/allocator/MM2Q.h"
 #include "cachelib/allocator/MemoryMonitor.h"
 #include "cachelib/allocator/NvmAdmissionPolicy.h"
@@ -44,11 +45,13 @@ class CacheAllocatorConfig {
   using AccessConfig = typename CacheT::AccessConfig;
   using ChainedItemMovingSync = typename CacheT::ChainedItemMovingSync;
   using RemoveCb = typename CacheT::RemoveCb;
+  using ItemDestructor = typename CacheT::ItemDestructor;
   using NvmCacheEncodeCb = typename CacheT::NvmCacheT::EncodeCB;
   using NvmCacheDecodeCb = typename CacheT::NvmCacheT::DecodeCB;
   using NvmCacheDeviceEncryptor = typename CacheT::NvmCacheT::DeviceEncryptor;
   using MoveCb = typename CacheT::MoveCb;
   using NvmCacheConfig = typename CacheT::NvmCacheT::Config;
+  using MemoryTierConfigs = std::vector<MemoryTierCacheConfig>;
   using Key = typename CacheT::Key;
   using EventTrackerSharedPtr = std::shared_ptr<typename CacheT::EventTracker>;
   using Item = typename CacheT::Item;
@@ -81,11 +84,17 @@ class CacheAllocatorConfig {
   CacheAllocatorConfig& setAccessConfig(size_t numEntries);
 
   // RemoveCallback is invoked for each item that is evicted or removed
-  // explicitly
+  // explicitly from RAM
   CacheAllocatorConfig& setRemoveCallback(RemoveCb cb);
+
+  // ItemDestructor is invoked for each item that is evicted or removed
+  // explicitly from cache (both RAM and NVM)
+  CacheAllocatorConfig& setItemDestructor(ItemDestructor destructor);
 
   // Config for NvmCache. If enabled, cachelib will also make use of flash.
   CacheAllocatorConfig& enableNvmCache(NvmCacheConfig config);
+
+  bool isNvmCacheEnabled() const;
 
   // enable the reject first admission policy through its parameters
   // @param numEntries          the number of entries to track across all splits
@@ -186,13 +195,25 @@ class CacheAllocatorConfig {
   // This allows cache to be persisted across restarts. One example use case is
   // to preserve the cache when releasing a new version of your service. Refer
   // to our user guide for how to set up cache persistence.
+  // TODO: get rid of baseAddr or if set make sure all mapping are adjacent?
+  // We can also make baseAddr a per-tier configuration
   CacheAllocatorConfig& enableCachePersistence(std::string directory,
                                                void* baseAddr = nullptr);
 
-  // uses posix shm segments instead of the default sys-v shm segments.
-  // @throw std::invalid_argument if called without enabling
-  // cachePersistence()
+  // Uses posix shm segments instead of the default sys-v shm
+  // segments. @throw std::invalid_argument if called without enabling
+  // cachePersistence().
   CacheAllocatorConfig& usePosixForShm();
+
+  // Configures cache memory tiers. Accepts vector of MemoryTierCacheConfig.
+  // Each vector element describes configuration for a single memory cache tier.
+  // @throw std::invalid_argument if:
+  // - the size of configs is 0
+  // - memory tiers use both size and ratio parameters
+  CacheAllocatorConfig& configureMemoryTiers(const MemoryTierConfigs& configs);
+
+  // Return vector of memory tier configs.
+  MemoryTierConfigs getMemoryTierConfigs() const;
 
   // This turns on a background worker that periodically scans through the
   // access container and look for expired items and remove them.
@@ -287,6 +308,14 @@ class CacheAllocatorConfig {
   // smaller than this will always be rejected by NvmAdmissionPolicy.
   CacheAllocatorConfig& setNvmAdmissionMinTTL(uint64_t ttl);
 
+  // skip promote children items in chained when parent fail to promote
+  CacheAllocatorConfig& setSkipPromoteChildrenWhenParentFailed();
+
+  // skip promote children items in chained when parent fail to promote
+  bool isSkipPromoteChildrenWhenParentFailed() const noexcept {
+    return skipPromoteChildrenWhenParentFailed;
+  }
+
   // @return whether compact cache is enabled
   bool isCompactCacheEnabled() const noexcept { return enableZeroedSlabAllocs; }
 
@@ -323,7 +352,7 @@ class CacheAllocatorConfig {
 
   const std::string& getCacheName() const noexcept { return cacheName; }
 
-  size_t getCacheSize() const noexcept { return size; }
+  size_t getCacheSize() const noexcept;
 
   bool isUsingPosixShm() const noexcept { return usePosixShm; }
 
@@ -486,8 +515,13 @@ class CacheAllocatorConfig {
   // for all normal items
   AccessConfig accessConfig{};
 
-  // user defined callback invoked when an item is being evicted or freed
+  // user defined callback invoked when an item is being evicted or freed from
+  // RAM
   RemoveCb removeCb{};
+
+  // user defined item destructor invoked when an item is being
+  // evicted or freed from cache (both RAM and NVM)
+  ItemDestructor itemDestructor{};
 
   // user defined call back to move the item. This is executed while holding
   // the user provided movingSync. For items without chained allocations,
@@ -541,9 +575,19 @@ class CacheAllocatorConfig {
   // cache.
   uint64_t nvmAdmissionMinTTL{0};
 
+  // skip promote children items in chained when parent fail to promote
+  bool skipPromoteChildrenWhenParentFailed{false};
+
   friend CacheT;
 
  private:
+  void validateMemoryTiersWithSize(const MemoryTierConfigs&, size_t) const;
+
+  // Configuration for memory tiers.
+  MemoryTierConfigs memoryTierConfigs{
+    {MemoryTierCacheConfig::fromShm().setRatio(1)}
+  };
+
   void mergeWithPrefix(
       std::map<std::string, std::string>& configMap,
       const std::map<std::string, std::string>& configMapToMerge,
@@ -562,6 +606,8 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setCacheName(
 
 template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setCacheSize(size_t _size) {
+  validateMemoryTiersWithSize(this->memoryTierConfigs, _size);
+
   size = _size;
   constexpr size_t maxCacheSizeWithCoredump = 64'424'509'440; // 60GB
   if (size <= maxCacheSizeWithCoredump) {
@@ -614,6 +660,13 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setRemoveCallback(
 }
 
 template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setItemDestructor(
+    ItemDestructor destructor) {
+  itemDestructor = std::move(destructor);
+  return *this;
+}
+
+template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::enableRejectFirstAPForNvm(
     uint64_t numEntries,
     uint32_t numSplits,
@@ -635,6 +688,11 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::enableNvmCache(
     NvmCacheConfig config) {
   nvmConfig.assign(config);
   return *this;
+}
+
+template <typename T>
+bool CacheAllocatorConfig<T>::isNvmCacheEnabled() const {
+  return nvmConfig.has_value();
 }
 
 template <typename T>
@@ -802,6 +860,61 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::enableItemReaperInBackground(
 }
 
 template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::configureMemoryTiers(
+      const MemoryTierConfigs& config) {
+  if (!config.size()) {
+    throw std::invalid_argument("There must be at least one memory tier.");
+  }
+
+  for (auto tier_config: config) {
+    auto tier_size = tier_config.getSize();
+    auto tier_ratio = tier_config.getRatio();
+    if ((!tier_size and !tier_ratio) || (tier_size and tier_ratio)) {
+      throw std::invalid_argument(
+        "For each memory tier either size or ratio must be set.");
+    }
+  }
+
+  validateMemoryTiersWithSize(config, this->size);
+
+  memoryTierConfigs = config;
+
+  return *this;
+}
+
+template <typename T>
+typename CacheAllocatorConfig<T>::MemoryTierConfigs
+CacheAllocatorConfig<T>::getMemoryTierConfigs() const {
+  MemoryTierConfigs config = memoryTierConfigs;
+  size_t sum_ratios = 0;
+
+  for (auto &tier_config: config) {
+    if (auto *v = std::get_if<PosixSysVSegmentOpts>(&tier_config.shmOpts)) {
+      v->usePosix = usePosixShm;
+    }
+
+    sum_ratios += tier_config.getRatio();
+  }
+
+  if (sum_ratios == 0)
+    return config;
+
+  // if ratios are used, size must be specified
+  XDCHECK(size);
+
+  // Convert ratios to sizes, size must be non-zero
+  size_t sum_sizes = 0;
+  size_t partition_size = size / sum_ratios;
+  for (auto& tier_config: config) {
+    tier_config.setSize(partition_size * tier_config.getRatio());
+    tier_config.setRatio(0);
+    sum_sizes += tier_config.getSize();
+  }
+
+  return config;
+}
+
+template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::disableCacheEviction() {
   disableEviction = true;
   return *this;
@@ -916,6 +1029,54 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setNvmAdmissionMinTTL(
   return *this;
 }
 
+// skip promote children items in chained when parent fail to promote
+template <typename T>
+CacheAllocatorConfig<T>&
+CacheAllocatorConfig<T>::setSkipPromoteChildrenWhenParentFailed() {
+  skipPromoteChildrenWhenParentFailed = true;
+  return *this;
+}
+
+template <typename T>
+size_t CacheAllocatorConfig<T>::getCacheSize() const noexcept {
+  if (size)
+    return size;
+
+  size_t sum_sizes = 0;
+  for (const auto &tier_config : getMemoryTierConfigs()) {
+    sum_sizes += tier_config.getSize();
+  }
+
+  return sum_sizes;
+}
+
+template <typename T>
+void CacheAllocatorConfig<T>::validateMemoryTiersWithSize(
+    const MemoryTierConfigs &config, size_t size) const {
+  size_t sum_ratios = 0;
+  size_t sum_sizes = 0;
+
+  for (const auto &tier_config: config) {
+    sum_ratios += tier_config.getRatio();
+    sum_sizes += tier_config.getSize();
+  }
+
+  if (sum_ratios && sum_sizes) {
+    throw  std::invalid_argument("Cannot mix ratios and sizes.");
+  } else if (sum_sizes) {
+    if (size && sum_sizes != size) {
+      throw std::invalid_argument(
+          "Sum of tier sizes doesn't match total cache size. "
+          "Setting of cache total size is not required when per-tier "
+          "sizes are specified - it is calculated as sum of tier sizes.");
+    }
+  } else if (!sum_ratios && !sum_sizes) {
+    throw std::invalid_argument(
+      "Either sum of all memory tiers sizes or sum of all ratios "
+      "must be greater than 0.");
+  }
+}
+
 template <typename T>
 const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
   // we can track tail hits only if MMType is MM2Q
@@ -924,11 +1085,7 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
         "Tail hits tracking cannot be enabled on MMTypes except MM2Q.");
   }
 
-  // The first part determines max number of "slots" we can address using
-  // CompressedPtr;
-  // The second part specifies the minimal allocation size for each slot.
-  // Multiplied, they inform us the maximal addressable space for cache.
-  size_t maxCacheSize = (1ul << CompressedPtr::kNumBits) * Slab::kMinAllocSize;
+  size_t maxCacheSize = CompressedPtr::getMaxAddressableSize();
   // Configured cache size should not exceed the maximal addressable space for
   // cache.
   if (size > maxCacheSize) {
@@ -937,6 +1094,29 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
         size,
         maxCacheSize));
   }
+
+  // we don't allow user to enable both RemoveCB and ItemDestructor
+  if (removeCb && itemDestructor) {
+    throw std::invalid_argument(
+        "It's not allowed to enable both RemoveCB and ItemDestructor.");
+  }
+
+  size_t sum_ratios = 0;
+  for (auto tier_config: memoryTierConfigs) {
+    sum_ratios += tier_config.getRatio();
+  }
+
+  if (sum_ratios) {
+    if (!size) {
+      throw std::invalid_argument(
+          "Total cache size must be specified when size ratios are "
+          "used to specify memory tier sizes.");
+    } else if (size < sum_ratios) {
+      throw std::invalid_argument(
+        "Sum of all tier size ratios is greater than total cache size.");
+    }
+  }
+
   return *this;
 }
 
@@ -970,7 +1150,7 @@ std::map<std::string, std::string> CacheAllocatorConfig<T>::serialize() const {
 
   configMap["size"] = std::to_string(size);
   configMap["cacheDir"] = cacheDir;
-  configMap["posixShm"] = usePosixShm ? "set" : "empty";
+  configMap["posixShm"] = isUsingPosixShm() ? "set" : "empty";
 
   configMap["defaultAllocSizes"] = "";
   // Stringify std::set

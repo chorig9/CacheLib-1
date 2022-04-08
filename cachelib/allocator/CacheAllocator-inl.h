@@ -16,26 +16,24 @@
 
 #pragma once
 
-#include "cachelib/allocator/CacheVersion.h"
-#include "cachelib/common/Utils.h"
+#include <folly/Random.h>
 
 namespace facebook {
 namespace cachelib {
 
 template <typename CacheTrait>
 CacheAllocator<CacheTrait>::CacheAllocator(Config config)
-    : isOnShm_{config.memMonitoringEnabled()},
+    : CacheBase(config.getMemoryTierConfigs().size()),
+      memoryTierConfigs(config.getMemoryTierConfigs()),
+      isOnShm_{config.memMonitoringEnabled()},
       config_(config.validate()),
-      tempShm_(isOnShm_ ? std::make_unique<TempShmMapping>(config_.size)
+      tempShm_(isOnShm_ ? std::make_unique<TempShmMapping>(
+                            config_.getCacheSize())
                         : nullptr),
-      allocator_(isOnShm_ ? std::make_unique<MemoryAllocator>(
-                                getAllocatorConfig(config_),
-                                tempShm_->getAddr(),
-                                config_.size)
-                          : std::make_unique<MemoryAllocator>(
-                                getAllocatorConfig(config_), config_.size)),
-      compactCacheManager_(std::make_unique<CCacheManager>(*allocator_)),
+      allocator_(createPrivateAllocator()),
+      compactCacheManager_(std::make_unique<CCacheManager>(*allocator_[0] /* TODO */)),
       compressor_(createPtrCompressor()),
+      mmContainers_(numTiers_),
       accessContainer_(std::make_unique<AccessContainer>(
           config_.accessConfig,
           compressor_,
@@ -46,21 +44,68 @@ CacheAllocator<CacheTrait>::CacheAllocator(Config config)
           [this](Item* it) -> ItemHandle { return acquire(it); })),
       chainedItemLocks_(config_.chainedItemsLockPower,
                         std::make_shared<MurmurHash2>()),
-      cacheCreationTime_{util::getCurrentTimeSec()},
-      nvmCacheState_{config_.cacheDir, config_.isNvmCacheEncryptionEnabled(),
-                     config_.isNvmCacheTruncateAllocSizeEnabled()} {
+      movesMap_(kShards),
+      moveLock_(kShards),
+      cacheCreationTime_{util::getCurrentTimeSec()} {
+
+  if (numTiers_ > 1 || std::holds_alternative<FileShmSegmentOpts>(
+      memoryTierConfigs[0].getShmTypeOpts())) {
+    throw std::runtime_error(
+      "Using custom memory tier or using more than one tier is only "
+      "supported for Shared Memory.");
+  }
   initCommon(false);
 }
 
 template <typename CacheTrait>
+std::vector<std::unique_ptr<MemoryAllocator>>
+CacheAllocator<CacheTrait>::createPrivateAllocator() {
+  std::vector<std::unique_ptr<MemoryAllocator>> allocators;
+
+  if (isOnShm_)
+    allocators.emplace_back(std::make_unique<MemoryAllocator>(
+                                getAllocatorConfig(config_),
+                                tempShm_->getAddr(),
+                                config_.size));
+  else
+    allocators.emplace_back(std::make_unique<MemoryAllocator>(
+                                getAllocatorConfig(config_), config_.size));
+
+  return allocators;
+}
+
+template <typename CacheTrait>
+std::vector<std::unique_ptr<MemoryAllocator>>
+CacheAllocator<CacheTrait>::createAllocators() {
+  std::vector<std::unique_ptr<MemoryAllocator>> allocators;
+  for (int tid = 0; tid < numTiers_; tid++) {
+    allocators.emplace_back(createNewMemoryAllocator(tid));
+  }
+  return allocators;
+}
+
+template <typename CacheTrait>
+std::vector<std::unique_ptr<MemoryAllocator>>
+CacheAllocator<CacheTrait>::restoreAllocators() {
+  std::vector<std::unique_ptr<MemoryAllocator>> allocators;
+  for (int tid = 0; tid < numTiers_; tid++) {
+    allocators.emplace_back(restoreMemoryAllocator(tid));
+  }
+  return allocators;
+}
+
+template <typename CacheTrait>
 CacheAllocator<CacheTrait>::CacheAllocator(SharedMemNewT, Config config)
-    : isOnShm_{true},
+    : CacheBase(config.getMemoryTierConfigs().size()),
+      memoryTierConfigs(config.getMemoryTierConfigs()),
+      isOnShm_{true},
       config_(config.validate()),
       shmManager_(
-          std::make_unique<ShmManager>(config_.cacheDir, config_.usePosixShm)),
-      allocator_(createNewMemoryAllocator()),
-      compactCacheManager_(std::make_unique<CCacheManager>(*allocator_)),
+          std::make_unique<ShmManager>(config_.cacheDir, config_.isUsingPosixShm())),
+      allocator_(createAllocators()),
+      compactCacheManager_(std::make_unique<CCacheManager>(*allocator_[0] /* TODO */)),
       compressor_(createPtrCompressor()),
+      mmContainers_(numTiers_),
       accessContainer_(std::make_unique<AccessContainer>(
           config_.accessConfig,
           shmManager_
@@ -68,7 +113,8 @@ CacheAllocator<CacheTrait>::CacheAllocator(SharedMemNewT, Config config)
                           AccessContainer::getRequiredSize(
                               config_.accessConfig.getNumBuckets()),
                           nullptr,
-                          ShmSegmentOpts(config_.accessConfig.getPageSize()))
+                          ShmSegmentOpts(config_.accessConfig.getPageSize(),
+                              false, config_.isUsingPosixShm()))
               .addr,
           compressor_,
           [this](Item* it) -> ItemHandle { return acquire(it); })),
@@ -79,48 +125,55 @@ CacheAllocator<CacheTrait>::CacheAllocator(SharedMemNewT, Config config)
                           AccessContainer::getRequiredSize(
                               config_.chainedItemAccessConfig.getNumBuckets()),
                           nullptr,
-                          ShmSegmentOpts(config_.accessConfig.getPageSize()))
+                          ShmSegmentOpts(config_.accessConfig.getPageSize(),
+                              false, config_.isUsingPosixShm()))
               .addr,
           compressor_,
           [this](Item* it) -> ItemHandle { return acquire(it); })),
       chainedItemLocks_(config_.chainedItemsLockPower,
                         std::make_shared<MurmurHash2>()),
-      cacheCreationTime_{util::getCurrentTimeSec()},
-      nvmCacheState_{config_.cacheDir, config_.isNvmCacheEncryptionEnabled(),
-                     config_.isNvmCacheTruncateAllocSizeEnabled()} {
+      movesMap_(kShards),
+      moveLock_(kShards),
+      cacheCreationTime_{util::getCurrentTimeSec()} {
   initCommon(false);
-  shmManager_->removeShm(detail::kShmInfoName);
+  shmManager_->removeShm(detail::kShmInfoName,
+    PosixSysVSegmentOpts(config_.isUsingPosixShm()));
 }
 
 template <typename CacheTrait>
 CacheAllocator<CacheTrait>::CacheAllocator(SharedMemAttachT, Config config)
-    : isOnShm_{true},
+    : CacheBase(config.getMemoryTierConfigs().size()),
+      memoryTierConfigs(config.getMemoryTierConfigs()),
+      isOnShm_{true},
       config_(config.validate()),
       shmManager_(
           std::make_unique<ShmManager>(config_.cacheDir, config_.usePosixShm)),
       deserializer_(createDeserializer()),
       metadata_{deserializeCacheAllocatorMetadata(*deserializer_)},
-      allocator_(restoreMemoryAllocator()),
-      compactCacheManager_(restoreCCacheManager()),
+      allocator_(restoreAllocators()),
+      compactCacheManager_(restoreCCacheManager(0 /* TODO - per tier */)),
       compressor_(createPtrCompressor()),
       mmContainers_(deserializeMMContainers(*deserializer_, compressor_)),
       accessContainer_(std::make_unique<AccessContainer>(
           deserializer_->deserialize<AccessSerializationType>(),
           config_.accessConfig,
-          shmManager_->attachShm(detail::kShmHashTableName),
+          shmManager_->attachShm(detail::kShmHashTableName, nullptr,
+            ShmSegmentOpts(PageSizeT::NORMAL, false, config_.isUsingPosixShm())),
           compressor_,
           [this](Item* it) -> ItemHandle { return acquire(it); })),
       chainedItemAccessContainer_(std::make_unique<AccessContainer>(
           deserializer_->deserialize<AccessSerializationType>(),
           config_.chainedItemAccessConfig,
-          shmManager_->attachShm(detail::kShmChainedItemHashTableName),
+          shmManager_->attachShm(detail::kShmChainedItemHashTableName, nullptr,
+            ShmSegmentOpts(PageSizeT::NORMAL, false, config_.isUsingPosixShm())),
           compressor_,
           [this](Item* it) -> ItemHandle { return acquire(it); })),
       chainedItemLocks_(config_.chainedItemsLockPower,
                         std::make_shared<MurmurHash2>()),
-      cacheCreationTime_{*metadata_.cacheCreationTime_ref()},
-      nvmCacheState_{config_.cacheDir, config_.isNvmCacheEncryptionEnabled(),
-                     config_.isNvmCacheTruncateAllocSizeEnabled()} {
+      movesMap_(kShards),
+      moveLock_(kShards),
+      cacheCreationTime_{*metadata_.cacheCreationTime_ref()} {
+  /* TODO - per tier? */
   for (auto pid : *metadata_.compactCachePools_ref()) {
     isCompactCachePool_[pid] = true;
   }
@@ -130,7 +183,8 @@ CacheAllocator<CacheTrait>::CacheAllocator(SharedMemAttachT, Config config)
   // We will create a new info shm segment on shutDown(). If we don't remove
   // this info shm segment here and the new info shm segment's size is larger
   // than this one, creating new one will fail.
-  shmManager_->removeShm(detail::kShmInfoName);
+  shmManager_->removeShm(detail::kShmInfoName,
+    PosixSysVSegmentOpts(config_.isUsingPosixShm()));
 }
 
 template <typename CacheTrait>
@@ -144,44 +198,50 @@ CacheAllocator<CacheTrait>::~CacheAllocator() {
 }
 
 template <typename CacheTrait>
-std::unique_ptr<MemoryAllocator>
-CacheAllocator<CacheTrait>::createNewMemoryAllocator() {
+ShmSegmentOpts CacheAllocator<CacheTrait>::createShmCacheOpts(TierId tid) {
   ShmSegmentOpts opts;
   opts.alignment = sizeof(Slab);
-  return std::make_unique<MemoryAllocator>(
-      getAllocatorConfig(config_),
-      shmManager_
-          ->createShm(detail::kShmCacheName, config_.size,
-                      config_.slabMemoryBaseAddr, opts)
-          .addr,
-      config_.size);
+  opts.typeOpts = memoryTierConfigs[tid].getShmTypeOpts();
+
+  return opts;
 }
 
 template <typename CacheTrait>
 std::unique_ptr<MemoryAllocator>
-CacheAllocator<CacheTrait>::restoreMemoryAllocator() {
-  ShmSegmentOpts opts;
-  opts.alignment = sizeof(Slab);
+CacheAllocator<CacheTrait>::createNewMemoryAllocator(TierId tid) {
+  return std::make_unique<MemoryAllocator>(
+      getAllocatorConfig(config_),
+      shmManager_
+          ->createShm(detail::kShmCacheName + std::to_string(tid),
+                      config_.getCacheSize(), config_.slabMemoryBaseAddr,
+                      createShmCacheOpts(tid))
+          .addr,
+      memoryTierConfigs[tid].getSize());
+}
+
+template <typename CacheTrait>
+std::unique_ptr<MemoryAllocator>
+CacheAllocator<CacheTrait>::restoreMemoryAllocator(TierId tid) {
   return std::make_unique<MemoryAllocator>(
       deserializer_->deserialize<MemoryAllocator::SerializationType>(),
       shmManager_
-          ->attachShm(detail::kShmCacheName, config_.slabMemoryBaseAddr, opts)
-          .addr,
-      config_.size,
+          ->attachShm(detail::kShmCacheName + std::to_string(tid),
+            config_.slabMemoryBaseAddr, createShmCacheOpts(tid)).addr,
+      memoryTierConfigs[tid].getSize(),
       config_.disableFullCoredump);
 }
 
 template <typename CacheTrait>
 std::unique_ptr<CCacheManager>
-CacheAllocator<CacheTrait>::restoreCCacheManager() {
+CacheAllocator<CacheTrait>::restoreCCacheManager(TierId tid) {
   return std::make_unique<CCacheManager>(
       deserializer_->deserialize<CCacheManager::SerializationType>(),
-      *allocator_);
+      *allocator_[tid]);
 }
 
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::initCommon(bool dramCacheAttached) {
-  if (config_.nvmConfig.has_value()) {
+  if (config_.isNvmCacheEnabled()) {
     if (config_.nvmCacheAP) {
       nvmAdmissionPolicy_ = config_.nvmCacheAP;
     } else if (config_.rejectFirstAPNumEntries) {
@@ -204,9 +264,12 @@ void CacheAllocator<CacheTrait>::initCommon(bool dramCacheAttached) {
 
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
-  if (!config_.nvmConfig.has_value()) {
+  if (!config_.isNvmCacheEnabled()) {
     return;
   }
+
+  nvmCacheState_.emplace(NvmCacheState(config_.cacheDir, config_.isNvmCacheEncryptionEnabled(),
+                                       config_.isNvmCacheTruncateAllocSizeEnabled()));
 
   // for some usecases that create pools, restoring nvmcache when dram cache
   // is not persisted is not supported.
@@ -214,14 +277,15 @@ void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
 
   // if we are dealing with persistency, cache directory should be enabled
   const bool truncate = config_.cacheDir.empty() ||
-                        nvmCacheState_.shouldStartFresh() || shouldDrop;
+                        nvmCacheState_.value().shouldStartFresh() || shouldDrop;
   if (truncate) {
-    nvmCacheState_.markTruncated();
+    nvmCacheState_.value().markTruncated();
   }
 
-  nvmCache_ = std::make_unique<NvmCacheT>(*this, *config_.nvmConfig, truncate);
+  nvmCache_ = std::make_unique<NvmCacheT>(*this, *config_.nvmConfig, truncate,
+                                          config_.itemDestructor);
   if (!config_.cacheDir.empty()) {
-    nvmCacheState_.clearPrevState();
+    nvmCacheState_.value().clearPrevState();
   }
 }
 
@@ -265,7 +329,8 @@ void CacheAllocator<CacheTrait>::initWorkers() {
 
 template <typename CacheTrait>
 std::unique_ptr<Deserializer> CacheAllocator<CacheTrait>::createDeserializer() {
-  auto infoAddr = shmManager_->attachShm(detail::kShmInfoName);
+  auto infoAddr = shmManager_->attachShm(detail::kShmInfoName, nullptr,
+            ShmSegmentOpts(PageSizeT::NORMAL, false, config_.isUsingPosixShm()));
   return std::make_unique<Deserializer>(
       reinterpret_cast<uint8_t*>(infoAddr.addr),
       reinterpret_cast<uint8_t*>(infoAddr.addr) + infoAddr.size);
@@ -287,7 +352,8 @@ CacheAllocator<CacheTrait>::allocate(PoolId poolId,
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ItemHandle
-CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
+CacheAllocator<CacheTrait>::allocateInternalTier(TierId tid,
+                                             PoolId pid,
                                              typename Item::Key key,
                                              uint32_t size,
                                              uint32_t creationTime,
@@ -300,13 +366,16 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
   const auto requiredSize = Item::getRequiredSize(key, size);
 
   // the allocation class in our memory allocator.
-  const auto cid = allocator_->getAllocationClassId(pid, requiredSize);
+  const auto cid = allocator_[tid]->getAllocationClassId(pid, requiredSize);
 
+  // TODO: per-tier
   (*stats_.allocAttempts)[pid][cid].inc();
 
-  void* memory = allocator_->allocate(pid, requiredSize);
+  void* memory = allocator_[tid]->allocate(pid, requiredSize);
+  // TODO: Today disableEviction means do not evict from memory (DRAM).
+  //       Should we support eviction between memory tiers (e.g. from DRAM to PMEM)?
   if (memory == nullptr && !config_.disableEviction) {
-    memory = findEviction(pid, cid);
+    memory = findEviction(tid, pid, cid);
   }
 
   ItemHandle handle;
@@ -317,7 +386,7 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
     // for example.
     SCOPE_FAIL {
       // free back the memory to the allocator since we failed.
-      allocator_->free(memory);
+      allocator_[tid]->free(memory);
     };
 
     handle = acquire(new (memory) Item(key, size, creationTime, expiryTime));
@@ -328,7 +397,7 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
     }
 
   } else { // failed to allocate memory.
-    (*stats_.allocFailures)[pid][cid].inc();
+    (*stats_.allocFailures)[pid][cid].inc(); // TODO: per-tier
     // wake up rebalancer
     if (poolRebalancer_) {
       poolRebalancer_->wakeUp();
@@ -347,7 +416,22 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ItemHandle
-CacheAllocator<CacheTrait>::allocateChainedItem(const ItemHandle& parent,
+CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
+                                             typename Item::Key key,
+                                             uint32_t size,
+                                             uint32_t creationTime,
+                                             uint32_t expiryTime) {
+  auto tid = 0; /* TODO: consult admission policy */
+  for(TierId tid = 0; tid < numTiers_; ++tid) {
+    auto handle = allocateInternalTier(tid, pid, key, size, creationTime, expiryTime);
+    if (handle) return handle;
+  }
+  return {};
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::WriteHandle
+CacheAllocator<CacheTrait>::allocateChainedItem(const ReadHandle& parent,
                                                 uint32_t size) {
   if (!parent) {
     throw std::invalid_argument(
@@ -365,9 +449,9 @@ CacheAllocator<CacheTrait>::allocateChainedItem(const ItemHandle& parent,
 }
 
 template <typename CacheTrait>
-typename CacheAllocator<CacheTrait>::ItemHandle
+typename CacheAllocator<CacheTrait>::WriteHandle
 CacheAllocator<CacheTrait>::allocateChainedItemInternal(
-    const ItemHandle& parent, uint32_t size) {
+    const ReadHandle& parent, uint32_t size) {
   util::LatencyTracker tracker{stats().allocateLatency_};
 
   SCOPE_FAIL { stats_.invalidAllocs.inc(); };
@@ -375,24 +459,30 @@ CacheAllocator<CacheTrait>::allocateChainedItemInternal(
   // number of bytes required for this item
   const auto requiredSize = ChainedItem::getRequiredSize(size);
 
-  const auto pid = allocator_->getAllocInfo(parent->getMemory()).poolId;
-  const auto cid = allocator_->getAllocationClassId(pid, requiredSize);
+  // TODO: is this correct?
+  auto tid = getTierId(*parent);
 
+  const auto pid = allocator_[tid]->getAllocInfo(parent->getMemory()).poolId;
+  const auto cid = allocator_[tid]->getAllocationClassId(pid, requiredSize);
+
+  // TODO: per-tier? Right now stats_ are not used in any public periodic
+  // worker
   (*stats_.allocAttempts)[pid][cid].inc();
 
-  void* memory = allocator_->allocate(pid, requiredSize);
+  void* memory = allocator_[tid]->allocate(pid, requiredSize);
   if (memory == nullptr) {
-    memory = findEviction(pid, cid);
+    memory = findEviction(tid, pid, cid);
   }
   if (memory == nullptr) {
     (*stats_.allocFailures)[pid][cid].inc();
     return ItemHandle{};
   }
 
-  SCOPE_FAIL { allocator_->free(memory); };
+  SCOPE_FAIL { allocator_[tid]->free(memory); };
 
-  auto child = acquire(new (memory) ChainedItem(
-      compressor_.compress(parent.get()), size, util::getCurrentTimeSec()));
+  auto child = acquire(
+      new (memory) ChainedItem(compressor_.compress(parent.getInternal()), size,
+                               util::getCurrentTimeSec()));
 
   if (child) {
     child.markNascent();
@@ -697,8 +787,8 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
     throw std::runtime_error(
         folly::sformat("cannot release this item: {}", it.toString()));
   }
-
-  const auto allocInfo = allocator_->getAllocInfo(it.getMemory());
+  const auto tid = getTierId(it);
+  const auto allocInfo = allocator_[tid]->getAllocInfo(it.getMemory());
 
   if (ctx == RemoveContext::kEviction) {
     const auto timeNow = util::getCurrentTimeSec();
@@ -722,8 +812,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
           folly::sformat("Can not recycle a chained item {}, toRecyle",
                          it.toString(), toRecycle->toString()));
     }
-
-    allocator_->free(&it);
+    allocator_[tid]->free(&it);
     return ReleaseRes::kReleased;
   }
 
@@ -732,6 +821,22 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
   // not initialized from the user perspective and never part of the cache.
   if (!nascent && config_.removeCb) {
     config_.removeCb(RemoveCbData{ctx, it, viewAsChainedAllocsRange(it)});
+  }
+
+  // only skip destructor for evicted items that are either in the queue to put
+  // into nvm or already in nvm
+  if (!nascent && config_.itemDestructor &&
+      (ctx != RemoveContext::kEviction || !it.isNvmClean() ||
+       it.isNvmEvicted())) {
+    try {
+      config_.itemDestructor(DestructorData{
+          ctx, it, viewAsChainedAllocsRange(it), allocInfo.poolId});
+      stats().numRamDestructorCalls.inc();
+    } catch (const std::exception& e) {
+      stats().numDestructorExceptions.inc();
+      XLOG_EVERY_N(INFO, 100)
+          << "Catch exception from user's item destructor: " << e.what();
+    }
   }
 
   // If no `toRecycle` is set, then the result is kReleased
@@ -766,7 +871,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
       auto next = head->getNext(compressor_);
 
       const auto childInfo =
-          allocator_->getAllocInfo(static_cast<const void*>(head));
+          allocator_[tid]->getAllocInfo(static_cast<const void*>(head));
       (*stats_.fragmentationSize)[childInfo.poolId][childInfo.classId].sub(
           util::getFragmentation(*this, *head));
 
@@ -799,7 +904,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
           XDCHECK(ReleaseRes::kReleased != res);
           res = ReleaseRes::kRecycled;
         } else {
-          allocator_->free(head);
+          allocator_[tid]->free(head);
         }
       }
 
@@ -814,7 +919,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
     res = ReleaseRes::kRecycled;
   } else {
     XDCHECK(it.isDrained());
-    allocator_->free(&it);
+    allocator_[tid]->free(&it);
   }
 
   return res;
@@ -884,6 +989,25 @@ bool CacheAllocator<CacheTrait>::replaceInMMContainer(Item& oldItem,
   } else {
     return oldContainer.remove(oldItem) && newContainer.add(newItem);
   }
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::replaceInMMContainer(Item* oldItem,
+                                                      Item& newItem) {
+  return replaceInMMContainer(*oldItem, newItem);
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::replaceInMMContainer(EvictionIterator& oldItemIt,
+                                                      Item& newItem) {
+  auto& oldContainer = getMMContainer(*oldItemIt);
+  auto& newContainer = getMMContainer(newItem);
+
+  // This function is used for eviction across tiers
+  XDCHECK(&oldContainer != &newContainer);
+  oldContainer.remove(oldItemIt);
+
+  return newContainer.add(newItem);
 }
 
 template <typename CacheTrait>
@@ -979,8 +1103,18 @@ CacheAllocator<CacheTrait>::insertOrReplace(const ItemHandle& handle) {
   insertInMMContainer(*(handle.getInternal()));
   ItemHandle replaced;
   try {
+    auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(handle->getKey())
+                          : std::unique_lock<std::mutex>();
+
     replaced = accessContainer_->insertOrReplace(*(handle.getInternal()));
-  } catch (const exception::RefcountOverflow&) {
+
+    if (replaced && replaced->isNvmClean() && !replaced->isNvmEvicted()) {
+      // item is to be replaced and the destructor will be executed
+      // upon memory released, mark it in nvm to avoid destructor
+      // executed from nvm
+      nvmCache_->markNvmItemRemovedLocked(handle->getKey());
+    }
+  } catch (const std::exception&) {
     removeFromMMContainer(*(handle.getInternal()));
     if (auto eventTracker = getEventTracker()) {
       eventTracker->record(AllocatorApiEvent::INSERT_OR_REPLACE,
@@ -1018,6 +1152,157 @@ CacheAllocator<CacheTrait>::insertOrReplace(const ItemHandle& handle) {
   }
 
   return replaced;
+}
+
+/* Next two methods are used to asynchronously move Item between memory tiers.
+ *
+ * The thread, which moves Item, allocates new Item in the tier we are moving to
+ * and calls moveRegularItemOnEviction() method. This method does the following:
+ *  1. Create MoveCtx and put it to the movesMap.
+ *  2. Update the access container with the new item from the tier we are
+ *     moving to. This Item has kIncomplete flag set.
+ *  3. Copy data from the old Item to the new one.
+ *  4. Unset the kIncomplete flag and Notify MoveCtx
+ *
+ * Concurrent threads which are getting handle to the same key:
+ *  1. When a handle is created it checks if the kIncomplete flag is set
+ *  2. If so, Handle implementation creates waitContext and adds it to the
+ *     MoveCtx by calling addWaitContextForMovingItem() method.
+ *  3. Wait until the moving thread will complete its job.
+ */
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::addWaitContextForMovingItem(
+    folly::StringPiece key, std::shared_ptr<WaitContext<ReadHandle>> waiter) {
+  auto shard = getShardForKey(key);
+  auto& movesMap = getMoveMapForShard(shard);
+  auto lock = getMoveLockForShard(shard);
+  auto it = movesMap.find(key);
+  if (it == movesMap.end()) {
+    return false;
+  }
+  auto ctx = it->second.get();
+  ctx->addWaiter(std::move(waiter));
+  return true;
+}
+
+template <typename CacheTrait>
+template <typename ItemPtr>
+typename CacheAllocator<CacheTrait>::ItemHandle
+CacheAllocator<CacheTrait>::moveRegularItemOnEviction(
+    ItemPtr& oldItemPtr, ItemHandle& newItemHdl) {
+  // TODO: should we introduce new latency tracker. E.g. evictRegularLatency_
+  // ??? util::LatencyTracker tracker{stats_.evictRegularLatency_};
+
+  Item& oldItem = *oldItemPtr;
+  if (!oldItem.isAccessible() || oldItem.isExpired()) {
+    return {};
+  }
+
+  XDCHECK_EQ(newItemHdl->getSize(), oldItem.getSize());
+  XDCHECK_NE(getTierId(oldItem), getTierId(*newItemHdl));
+
+  // take care of the flags before we expose the item to be accessed. this
+  // will ensure that when another thread removes the item from RAM, we issue
+  // a delete accordingly. See D7859775 for an example
+  if (oldItem.isNvmClean()) {
+    newItemHdl->markNvmClean();
+  }
+
+  folly::StringPiece key(oldItem.getKey());
+  auto shard = getShardForKey(key);
+  auto& movesMap = getMoveMapForShard(shard);
+  MoveCtx* ctx(nullptr);
+  {
+    auto lock = getMoveLockForShard(shard);
+    auto res = movesMap.try_emplace(key, std::make_unique<MoveCtx>());
+    if (!res.second) {
+      return {};
+    }
+    ctx = res.first->second.get();
+  }
+
+  auto resHdl = ItemHandle{};
+  auto guard = folly::makeGuard([key, this, ctx, shard, &resHdl]() {
+    auto& movesMap = getMoveMapForShard(shard);
+    if (resHdl)
+      resHdl->unmarkIncomplete();
+    auto lock = getMoveLockForShard(shard);
+    ctx->setItemHandle(std::move(resHdl));
+    movesMap.erase(key);
+  });
+
+  // TODO: Possibly we can use markMoving() instead. But today
+  // moveOnSlabRelease logic assume that we mark as moving old Item
+  // and than do copy and replace old Item with the new one in access
+  // container. Furthermore, Item can be marked as Moving only
+  // if it is linked to MM container. In our case we mark the new Item
+  // and update access container before the new Item is ready (content is
+  // copied).
+  newItemHdl->markIncomplete();
+
+  // Inside the access container's lock, this checks if the old item is
+  // accessible and its refcount is zero. If the item is not accessible,
+  // there is no point to replace it since it had already been removed
+  // or in the process of being removed. If the item is in cache but the
+  // refcount is non-zero, it means user could be attempting to remove
+  // this item through an API such as remove(ItemHandle). In this case,
+  // it is unsafe to replace the old item with a new one, so we should
+  // also abort.
+  if (!accessContainer_->replaceIf(oldItem, *newItemHdl,
+                                   itemEvictionPredicate)) {
+    return {};
+  }
+
+  if (config_.moveCb) {
+    // Execute the move callback. We cannot make any guarantees about the
+    // consistency of the old item beyond this point, because the callback can
+    // do more than a simple memcpy() e.g. update external references. If there
+    // are any remaining handles to the old item, it is the caller's
+    // responsibility to invalidate them. The move can only fail after this
+    // statement if the old item has been removed or replaced, in which case it
+    // should be fine for it to be left in an inconsistent state.
+    config_.moveCb(oldItem, *newItemHdl, nullptr);
+  } else {
+    std::memcpy(newItemHdl->getWritableMemory(), oldItem.getMemory(),
+                oldItem.getSize());
+  }
+
+  // Inside the MM container's lock, this checks if the old item exists to
+  // make sure that no other thread removed it, and only then replaces it.
+  if (!replaceInMMContainer(oldItemPtr, *newItemHdl)) {
+    accessContainer_->remove(*newItemHdl);
+    return {};
+  }
+
+  // Replacing into the MM container was successful, but someone could have
+  // called insertOrReplace() or remove() before or after the
+  // replaceInMMContainer() operation, which would invalidate newItemHdl.
+  if (!newItemHdl->isAccessible()) {
+    removeFromMMContainer(*newItemHdl);
+    return {};
+  }
+
+  // no one can add or remove chained items at this point
+  if (oldItem.hasChainedItem()) {
+    // safe to acquire handle for a moving Item
+    auto oldHandle = acquire(&oldItem);
+    XDCHECK_EQ(1u, oldHandle->getRefCount()) << oldHandle->toString();
+    XDCHECK(!newItemHdl->hasChainedItem()) << newItemHdl->toString();
+    try {
+      auto l = chainedItemLocks_.lockExclusive(oldItem.getKey());
+      transferChainLocked(oldHandle, newItemHdl);
+    } catch (const std::exception& e) {
+      // this should never happen because we drained all the handles.
+      XLOGF(DFATAL, "{}", e.what());
+      throw;
+    }
+
+    XDCHECK(!oldItem.hasChainedItem());
+    XDCHECK(newItemHdl->hasChainedItem());
+  }
+  newItemHdl.unmarkNascent();
+  resHdl = std::move(newItemHdl); // guard will assign it to ctx under lock
+  return acquire(&oldItem);
 }
 
 template <typename CacheTrait>
@@ -1162,8 +1447,8 @@ bool CacheAllocator<CacheTrait>::moveChainedItem(ChainedItem& oldItem,
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::Item*
-CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
-  auto& mmContainer = getMMContainer(pid, cid);
+CacheAllocator<CacheTrait>::findEviction(TierId tid, PoolId pid, ClassId cid) {
+  auto& mmContainer = getMMContainer(tid, pid, cid);
 
   // Keep searching for a candidate until we were able to evict it
   // or until the search limit has been exhausted
@@ -1178,10 +1463,17 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
     // for chained items, the ownership of the parent can change. We try to
     // evict what we think as parent and see if the eviction of parent
     // recycles the child we intend to.
-    auto toReleaseHandle =
-        itr->isChainedItem()
-            ? advanceIteratorAndTryEvictChainedItem(itr)
-            : advanceIteratorAndTryEvictRegularItem(mmContainer, itr);
+    
+    ItemHandle toReleaseHandle = tryEvictToNextMemoryTier(tid, pid, itr);
+    bool movedToNextTier = false;
+    if(toReleaseHandle) {
+      movedToNextTier = true;
+    } else {
+      toReleaseHandle =
+          itr->isChainedItem()
+              ? advanceIteratorAndTryEvictChainedItem(tid, pid, itr)
+              : advanceIteratorAndTryEvictRegularItem(tid, pid, mmContainer, itr);
+    }
 
     if (toReleaseHandle) {
       if (toReleaseHandle->hasChainedItem()) {
@@ -1212,7 +1504,7 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
       // recycle the candidate.
       if (ReleaseRes::kRecycled ==
           releaseBackToAllocator(itemToRelease, RemoveContext::kEviction,
-                                 /* isNascent */ false, candidate)) {
+                                 /* isNascent */ movedToNextTier, candidate)) {
         return candidate;
       }
     }
@@ -1275,12 +1567,46 @@ bool CacheAllocator<CacheTrait>::shouldWriteToNvmCacheExclusive(
 }
 
 template <typename CacheTrait>
+template <typename ItemPtr>
+typename CacheAllocator<CacheTrait>::ItemHandle
+CacheAllocator<CacheTrait>::tryEvictToNextMemoryTier(
+    TierId tid, PoolId pid, ItemPtr& item) {
+  if(item->isChainedItem()) return {}; // TODO: We do not support ChainedItem yet
+  if(item->isExpired()) return acquire(item);
+
+  TierId nextTier = tid; // TODO - calculate this based on some admission policy
+  while (++nextTier < numTiers_) { // try to evict down to the next memory tiers
+    // allocateInternal might trigger another eviction
+    auto newItemHdl = allocateInternalTier(nextTier, pid,
+                     item->getKey(),
+                     item->getSize(),
+                     item->getCreationTime(),
+                     item->getExpiryTime());
+
+    if (newItemHdl) {
+      XDCHECK_EQ(newItemHdl->getSize(), item->getSize());
+
+      return moveRegularItemOnEviction(item, newItemHdl);
+    }
+  }
+
+  return {};
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::ItemHandle
+CacheAllocator<CacheTrait>::tryEvictToNextMemoryTier(Item* item) {
+  auto tid = getTierId(*item);
+  auto pid = allocator_[tid]->getAllocInfo(item->getMemory()).poolId;
+  return tryEvictToNextMemoryTier(tid, pid, item);
+}
+
+template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ItemHandle
 CacheAllocator<CacheTrait>::advanceIteratorAndTryEvictRegularItem(
-    MMContainer& mmContainer, EvictionIterator& itr) {
-  // we should flush this to nvmcache if it is not already present in nvmcache
-  // and the item is not expired.
+    TierId tid, PoolId pid, MMContainer& mmContainer, EvictionIterator& itr) {
   Item& item = *itr;
+
   const bool evictToNvmCache = shouldWriteToNvmCache(item);
 
   auto token = evictToNvmCache ? nvmCache_->createPutToken(item.getKey())
@@ -1343,7 +1669,7 @@ CacheAllocator<CacheTrait>::advanceIteratorAndTryEvictRegularItem(
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ItemHandle
 CacheAllocator<CacheTrait>::advanceIteratorAndTryEvictChainedItem(
-    EvictionIterator& itr) {
+    TierId tid, PoolId pid, EvictionIterator& itr) {
   XDCHECK(itr->isChainedItem());
 
   ChainedItem* candidate = &itr->asChainedItem();
@@ -1393,6 +1719,8 @@ CacheAllocator<CacheTrait>::advanceIteratorAndTryEvictChainedItem(
 
   XDCHECK(!parent.isInMMContainer());
   XDCHECK(!parent.isAccessible());
+
+  // TODO: add multi-tier support (similar as for unchained items)
 
   // We need to make sure the parent is not marked as moving
   // and we're the only holder of the parent item. Safe to destroy the handle
@@ -1528,7 +1856,7 @@ CacheAllocator<CacheTrait>::remove(AccessIterator& it) {
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::RemoveRes
-CacheAllocator<CacheTrait>::remove(const ItemHandle& it) {
+CacheAllocator<CacheTrait>::remove(const ReadHandle& it) {
   stats_.numCacheRemoves.inc();
   if (!it) {
     throw std::invalid_argument("Trying to remove a null item handle");
@@ -1544,20 +1872,33 @@ CacheAllocator<CacheTrait>::removeImpl(Item& item,
                                        DeleteTombStoneGuard tombstone,
                                        bool removeFromNvm,
                                        bool recordApiEvent) {
-  // Enqueue delete to nvmCache if we know from the item that it was pulled in
-  // from NVM. If the item was not pulled in from NVM, it is not possible to
-  // have it be written to NVM.
-  if (nvmCache_ && removeFromNvm && item.isNvmClean()) {
-    XDCHECK(tombstone);
-    nvmCache_->remove(item.getKey(), std::move(tombstone));
-  }
+  bool success = false;
+  {
+    auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(item.getKey())
+                          : std::unique_lock<std::mutex>();
 
-  const bool success = accessContainer_->remove(item);
+    success = accessContainer_->remove(item);
+
+    if (removeFromNvm && success && item.isNvmClean() && !item.isNvmEvicted()) {
+      // item is to be removed and the destructor will be executed
+      // upon memory released, mark it in nvm to avoid destructor
+      // executed from nvm
+      nvmCache_->markNvmItemRemovedLocked(item.getKey());
+    }
+  }
   XDCHECK(!item.isAccessible());
 
   // remove it from the mm container. this will be no-op if it is already
   // removed.
   removeFromMMContainer(item);
+
+  // Enqueue delete to nvmCache if we know from the item that it was pulled in
+  // from NVM. If the item was not pulled in from NVM, it is not possible to
+  // have it be written to NVM.
+  if (removeFromNvm && item.isNvmClean()) {
+    XDCHECK(tombstone);
+    nvmCache_->remove(item.getKey(), std::move(tombstone));
+  }
 
   auto eventTracker = getEventTracker();
   if (recordApiEvent && eventTracker) {
@@ -1579,27 +1920,55 @@ CacheAllocator<CacheTrait>::removeImpl(Item& item,
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::invalidateNvm(Item& item) {
   if (nvmCache_ != nullptr && item.isAccessible() && item.isNvmClean()) {
-    item.unmarkNvmClean();
+    {
+      auto lock = nvmCache_->getItemDestructorLock(item.getKey());
+      if (!item.isNvmEvicted() && item.isNvmClean() && item.isAccessible()) {
+        // item is being updated and invalidated in nvm. Mark the item to avoid
+        // destructor to be executed from nvm
+        nvmCache_->markNvmItemRemovedLocked(item.getKey());
+      }
+      item.unmarkNvmClean();
+    }
     nvmCache_->remove(item.getKey(),
                       nvmCache_->createDeleteTombStone(item.getKey()));
   }
 }
 
 template <typename CacheTrait>
-typename CacheAllocator<CacheTrait>::MMContainer&
-CacheAllocator<CacheTrait>::getMMContainer(const Item& item) const noexcept {
-  const auto allocInfo =
-      allocator_->getAllocInfo(static_cast<const void*>(&item));
-  return getMMContainer(allocInfo.poolId, allocInfo.classId);
+TierId
+CacheAllocator<CacheTrait>::getTierId(const Item& item) const {
+  return getTierId(item.getMemory());
+}
+
+template <typename CacheTrait>
+TierId
+CacheAllocator<CacheTrait>::getTierId(const void* ptr) const {
+  for (TierId tid = 0; tid < numTiers_; tid++) {
+    if (allocator_[tid]->isMemoryInAllocator(ptr))
+      return tid;
+  }
+
+  throw std::invalid_argument("Item does not belong to any tier!");
 }
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::MMContainer&
-CacheAllocator<CacheTrait>::getMMContainer(PoolId pid,
+CacheAllocator<CacheTrait>::getMMContainer(const Item& item) const noexcept {
+  const auto tid = getTierId(item);
+  const auto allocInfo =
+      allocator_[tid]->getAllocInfo(static_cast<const void*>(&item));
+  return getMMContainer(tid, allocInfo.poolId, allocInfo.classId);
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::MMContainer&
+CacheAllocator<CacheTrait>::getMMContainer(TierId tid,
+                                           PoolId pid,
                                            ClassId cid) const noexcept {
-  XDCHECK_LT(static_cast<size_t>(pid), mmContainers_.size());
-  XDCHECK_LT(static_cast<size_t>(cid), mmContainers_[pid].size());
-  return *mmContainers_[pid][cid];
+  XDCHECK_LT(static_cast<size_t>(tid), mmContainers_.size());
+  XDCHECK_LT(static_cast<size_t>(pid), mmContainers_[tid].size());
+  XDCHECK_LT(static_cast<size_t>(cid), mmContainers_[tid][pid].size());
+  return *mmContainers_[tid][pid][cid];
 }
 
 template <typename CacheTrait>
@@ -1702,6 +2071,26 @@ CacheAllocator<CacheTrait>::find(typename Item::Key key, AccessMode mode) {
 }
 
 template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::ItemHandle
+CacheAllocator<CacheTrait>::findToWrite(typename Item::Key key,
+                                        bool doNvmInvalidation) {
+  auto handle = find(key, AccessMode::kWrite);
+  if (handle == nullptr) {
+    return nullptr;
+  }
+  if (doNvmInvalidation) {
+    invalidateNvm(*handle);
+  }
+  return handle;
+}
+
+template <typename CacheTrait>
+typename CacheAllocator<CacheTrait>::ReadHandle
+CacheAllocator<CacheTrait>::find(typename Item::Key key) {
+  return find(key, AccessMode::kRead);
+}
+
+template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::markUseful(const ItemHandle& handle,
                                             AccessMode mode) {
   if (!handle) {
@@ -1709,9 +2098,11 @@ void CacheAllocator<CacheTrait>::markUseful(const ItemHandle& handle,
   }
 
   auto& item = *(handle.getInternal());
-  recordAccessInMMContainer(item, mode);
+  bool recorded = recordAccessInMMContainer(item, mode);
 
-  if (LIKELY(!item.hasChainedItem())) {
+  // if parent is not recorded, skip children as well when the config is set
+  if (LIKELY(!item.hasChainedItem() ||
+             (!recorded && config_.isSkipPromoteChildrenWhenParentFailed()))) {
     return;
   }
 
@@ -1721,10 +2112,11 @@ void CacheAllocator<CacheTrait>::markUseful(const ItemHandle& handle,
 }
 
 template <typename CacheTrait>
-void CacheAllocator<CacheTrait>::recordAccessInMMContainer(Item& item,
+bool CacheAllocator<CacheTrait>::recordAccessInMMContainer(Item& item,
                                                            AccessMode mode) {
+  const auto tid = getTierId(item);
   const auto allocInfo =
-      allocator_->getAllocInfo(static_cast<const void*>(&item));
+      allocator_[tid]->getAllocInfo(static_cast<const void*>(&item));
   (*stats_.cacheHits)[allocInfo.poolId][allocInfo.classId].inc();
 
   // track recently accessed items if needed
@@ -1732,14 +2124,15 @@ void CacheAllocator<CacheTrait>::recordAccessInMMContainer(Item& item,
     ring_->trackItem(reinterpret_cast<uintptr_t>(&item), item.getSize());
   }
 
-  auto& mmContainer = getMMContainer(allocInfo.poolId, allocInfo.classId);
-  mmContainer.recordAccess(item, mode);
+  auto& mmContainer = getMMContainer(tid, allocInfo.poolId, allocInfo.classId);
+  return mmContainer.recordAccess(item, mode);
 }
 
 template <typename CacheTrait>
 uint32_t CacheAllocator<CacheTrait>::getUsableSize(const Item& item) const {
+  const auto tid = getTierId(item);
   const auto allocSize =
-      allocator_->getAllocInfo(static_cast<const void*>(&item)).allocSize;
+      allocator_[tid]->getAllocInfo(static_cast<const void*>(&item)).allocSize;
   return item.isChainedItem()
              ? allocSize - ChainedItem::getRequiredSize(0)
              : allocSize - Item::getRequiredSize(item.getKey(), 0);
@@ -1748,8 +2141,11 @@ uint32_t CacheAllocator<CacheTrait>::getUsableSize(const Item& item) const {
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ItemHandle
 CacheAllocator<CacheTrait>::getSampleItem() {
+  // TODO: is using random tier a good idea?
+  auto tid = folly::Random::rand32() % numTiers_;
+
   const auto* item =
-      reinterpret_cast<const Item*>(allocator_->getRandomAlloc());
+      reinterpret_cast<const Item*>(allocator_[tid]->getRandomAlloc());
   if (!item) {
     return ItemHandle{};
   }
@@ -1764,38 +2160,47 @@ CacheAllocator<CacheTrait>::getSampleItem() {
 
 template <typename CacheTrait>
 std::vector<std::string> CacheAllocator<CacheTrait>::dumpEvictionIterator(
-    PoolId pid, ClassId cid, size_t numItems) {
+  PoolId pid, ClassId cid, size_t numItems) {
   if (numItems == 0) {
     return {};
   }
 
-  if (static_cast<size_t>(pid) >= mmContainers_.size() ||
-      static_cast<size_t>(cid) >= mmContainers_[pid].size()) {
+  // Always evict from the lowest layer.
+  int tid = numTiers_ - 1;
+
+  if (static_cast<size_t>(tid) >= mmContainers_.size() ||
+      static_cast<size_t>(pid) >= mmContainers_[tid].size() ||
+      static_cast<size_t>(cid) >= mmContainers_[tid][pid].size()) {
     throw std::invalid_argument(
-        folly::sformat("Invalid PoolId: {} and ClassId: {}.", pid, cid));
+        folly::sformat("Invalid TierId: {} and PoolId: {} and ClassId: {}.", tid, pid, cid));
   }
 
   std::vector<std::string> content;
 
-  auto& mm = *mmContainers_[pid][cid];
-  auto evictItr = mm.getEvictionIterator();
   size_t i = 0;
-  while (evictItr && i < numItems) {
-    content.push_back(evictItr->toString());
-    ++evictItr;
-    ++i;
+  while (i < numItems && tid >= 0) {
+    auto& mm = *mmContainers_[tid][pid][cid];
+    auto evictItr = mm.getEvictionIterator();
+    while (evictItr && i < numItems) {
+      content.push_back(evictItr->toString());
+      ++evictItr;
+      ++i;
+    }
+
+    --tid;
   }
 
   return content;
 }
 
 template <typename CacheTrait>
-folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBuf(ItemHandle handle) {
+template <typename Handle>
+folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBufT(Handle& handle) {
   if (!handle) {
     throw std::invalid_argument("null item handle for converting to IOBUf");
   }
 
-  Item* item = handle.get();
+  Item* item = handle.getInternal();
   const uint32_t dataOffset = item->getOffsetForMemory();
 
   using ConvertChainedItem = std::function<std::unique_ptr<folly::IOBuf>(
@@ -1807,7 +2212,7 @@ folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBuf(ItemHandle handle) {
   // determine to use a new ItemHandle for each chain items
   // or use shared ItemHandle for all chain items
   if (item->getRefCount() > config_.thresholdForConvertingToIOBuf) {
-    auto sharedHdl = std::make_shared<ItemHandle>(std::move(handle));
+    auto sharedHdl = std::make_shared<Handle>(std::move(handle));
 
     iobuf = folly::IOBuf{
         folly::IOBuf::TAKE_OWNERSHIP, item,
@@ -1818,10 +2223,10 @@ folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBuf(ItemHandle handle) {
         dataOffset + item->getSize(),
 
         [](void*, void* userData) {
-          auto* hdl = reinterpret_cast<std::shared_ptr<ItemHandle>*>(userData);
+          auto* hdl = reinterpret_cast<std::shared_ptr<Handle>*>(userData);
           delete hdl;
         } /* freeFunc */,
-        new std::shared_ptr<ItemHandle>{sharedHdl} /* userData for freeFunc */};
+        new std::shared_ptr<Handle>{sharedHdl} /* userData for freeFunc */};
 
     if (item->hasChainedItem()) {
       converter = [sharedHdl](Item*, ChainedItem& chainedItem) {
@@ -1836,30 +2241,27 @@ folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBuf(ItemHandle handle) {
             chainedItemDataOffset + chainedItem.getSize(),
 
             [](void*, void* userData) {
-              auto* hdl =
-                  reinterpret_cast<std::shared_ptr<ItemHandle>*>(userData);
+              auto* hdl = reinterpret_cast<std::shared_ptr<Handle>*>(userData);
               delete hdl;
             } /* freeFunc */,
-            new std::shared_ptr<ItemHandle>{
-                sharedHdl} /* userData for freeFunc */);
+            new std::shared_ptr<Handle>{sharedHdl} /* userData for freeFunc */);
       };
     }
 
   } else {
-    iobuf =
-        folly::IOBuf{folly::IOBuf::TAKE_OWNERSHIP, item,
+    iobuf = folly::IOBuf{folly::IOBuf::TAKE_OWNERSHIP, item,
 
-                     // Since we'll be moving the IOBuf data pointer forward
-                     // by dataOffset, we need to adjust the IOBuf length
-                     // accordingly
-                     dataOffset + item->getSize(),
+                         // Since we'll be moving the IOBuf data pointer forward
+                         // by dataOffset, we need to adjust the IOBuf length
+                         // accordingly
+                         dataOffset + item->getSize(),
 
-                     [](void* buf, void* userData) {
-                       ItemHandle{reinterpret_cast<Item*>(buf),
+                         [](void* buf, void* userData) {
+                           Handle{reinterpret_cast<Item*>(buf),
                                   *reinterpret_cast<decltype(this)>(userData)}
-                           .reset();
-                     } /* freeFunc */,
-                     this /* userData for freeFunc */};
+                               .reset();
+                         } /* freeFunc */,
+                         this /* userData for freeFunc */};
     handle.release();
 
     if (item->hasChainedItem()) {
@@ -1889,7 +2291,7 @@ folly::IOBuf CacheAllocator<CacheTrait>::convertToIOBuf(ItemHandle handle) {
               auto* cache = reinterpret_cast<decltype(this)>(userData);
               auto* child = reinterpret_cast<ChainedItem*>(buf);
               auto* parent = &child->getParentItem(cache->compressor_);
-              ItemHandle{parent, *cache}.reset();
+              Handle{parent, *cache}.reset();
             } /* freeFunc */,
             this /* userData for freeFunc */);
       };
@@ -1961,19 +2363,31 @@ PoolId CacheAllocator<CacheTrait>::addPool(
     std::shared_ptr<RebalanceStrategy> resizeStrategy,
     bool ensureProvisionable) {
   folly::SharedMutex::WriteHolder w(poolsResizeAndRebalanceLock_);
-  auto pid = allocator_->addPool(name, size, allocSizes, ensureProvisionable);
+
+  PoolId pid = 0;
+  auto tierConfigs = config_.getMemoryTierConfigs();
+  for (TierId tid = 0; tid < numTiers_; tid++) {
+    auto tierSizeRatio = static_cast<double>(
+        tierConfigs[tid].getSize()) / config_.getCacheSize();
+    auto tierPoolSize = static_cast<size_t>(tierSizeRatio * size);
+    auto res = allocator_[tid]->addPool(name, tierPoolSize, allocSizes, ensureProvisionable);
+    XDCHECK(tid == 0 || res == pid);
+    pid = res;
+  }
+
   createMMContainers(pid, std::move(config));
   setRebalanceStrategy(pid, std::move(rebalanceStrategy));
   setResizeStrategy(pid, std::move(resizeStrategy));
+
   return pid;
 }
 
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::overridePoolRebalanceStrategy(
     PoolId pid, std::shared_ptr<RebalanceStrategy> rebalanceStrategy) {
-  if (static_cast<size_t>(pid) >= mmContainers_.size()) {
+  if (static_cast<size_t>(pid) >= mmContainers_[0].size()) {
     throw std::invalid_argument(folly::sformat(
-        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
+        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_[0].size()));
   }
   setRebalanceStrategy(pid, std::move(rebalanceStrategy));
 }
@@ -1981,9 +2395,9 @@ void CacheAllocator<CacheTrait>::overridePoolRebalanceStrategy(
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::overridePoolResizeStrategy(
     PoolId pid, std::shared_ptr<RebalanceStrategy> resizeStrategy) {
-  if (static_cast<size_t>(pid) >= mmContainers_.size()) {
+  if (static_cast<size_t>(pid) >= mmContainers_[0].size()) {
     throw std::invalid_argument(folly::sformat(
-        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
+        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_[0].size()));
   }
   setResizeStrategy(pid, std::move(resizeStrategy));
 }
@@ -1995,14 +2409,14 @@ void CacheAllocator<CacheTrait>::overridePoolOptimizeStrategy(
 }
 
 template <typename CacheTrait>
-void CacheAllocator<CacheTrait>::overridePoolConfig(PoolId pid,
+void CacheAllocator<CacheTrait>::overridePoolConfig(TierId tid, PoolId pid,
                                                     const MMConfig& config) {
-  if (static_cast<size_t>(pid) >= mmContainers_.size()) {
+  // TODO: add generic tier id checking
+  if (static_cast<size_t>(pid) >= mmContainers_[tid].size()) {
     throw std::invalid_argument(folly::sformat(
-        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
+        "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_[tid].size()));
   }
-
-  auto& pool = allocator_->getPool(pid);
+  auto& pool = allocator_[tid]->getPool(pid);
   for (unsigned int cid = 0; cid < pool.getNumClassId(); ++cid) {
     MMConfig mmConfig = config;
     mmConfig.addExtraConfig(
@@ -2010,30 +2424,35 @@ void CacheAllocator<CacheTrait>::overridePoolConfig(PoolId pid,
             ? pool.getAllocationClass(static_cast<ClassId>(cid))
                   .getAllocsPerSlab()
             : 0);
-    DCHECK_NOTNULL(mmContainers_[pid][cid].get());
-
-    mmContainers_[pid][cid]->setConfig(mmConfig);
+    DCHECK_NOTNULL(mmContainers_[tid][pid][cid].get());
+    mmContainers_[tid][pid][cid]->setConfig(mmConfig);
   }
 }
 
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::createMMContainers(const PoolId pid,
                                                     MMConfig config) {
-  auto& pool = allocator_->getPool(pid);
+  // pools on each layer should have the same number of class id, etc.
+  // TODO: think about deduplication
+  auto& pool = allocator_[0]->getPool(pid);
+
   for (unsigned int cid = 0; cid < pool.getNumClassId(); ++cid) {
     config.addExtraConfig(
         config_.trackTailHits
             ? pool.getAllocationClass(static_cast<ClassId>(cid))
                   .getAllocsPerSlab()
             : 0);
-    mmContainers_[pid][cid].reset(new MMContainer(config, compressor_));
+    for (TierId tid = 0; tid < numTiers_; tid++) {
+      mmContainers_[tid][pid][cid].reset(new MMContainer(config, compressor_));
+    }
   }
 }
 
 template <typename CacheTrait>
 PoolId CacheAllocator<CacheTrait>::getPoolId(
     folly::StringPiece name) const noexcept {
-  return allocator_->getPoolId(name.str());
+  // each tier has the same pools
+  return allocator_[0]->getPoolId(name.str());
 }
 
 // The Function returns a consolidated vector of Release Slab
@@ -2076,7 +2495,9 @@ std::set<PoolId> CacheAllocator<CacheTrait>::filterCompactCachePools(
 template <typename CacheTrait>
 std::set<PoolId> CacheAllocator<CacheTrait>::getRegularPoolIds() const {
   folly::SharedMutex::ReadHolder r(poolsResizeAndRebalanceLock_);
-  return filterCompactCachePools(allocator_->getPoolIds());
+  // TODO - get rid of the duplication - right now, each tier
+  // holds pool objects with mostly the same info
+  return filterCompactCachePools(allocator_[0]->getPoolIds());
 }
 
 template <typename CacheTrait>
@@ -2101,10 +2522,9 @@ std::set<PoolId> CacheAllocator<CacheTrait>::getRegularPoolIdsForResize()
   // getAdvisedMemorySize - then pools may be overLimit even when
   // all slabs are not allocated. Otherwise, pools may be overLimit
   // only after all slabs are allocated.
-  //
-  return (allocator_->allSlabsAllocated()) ||
-                 (allocator_->getAdvisedMemorySize() != 0)
-             ? filterCompactCachePools(allocator_->getPoolsOverLimit())
+  return (allocator_[currentTier()]->allSlabsAllocated()) ||
+                 (allocator_[currentTier()]->getAdvisedMemorySize() != 0)
+             ? filterCompactCachePools(allocator_[currentTier()]->getPoolsOverLimit())
              : std::set<PoolId>{};
 }
 
@@ -2115,7 +2535,7 @@ const std::string CacheAllocator<CacheTrait>::getCacheName() const {
 
 template <typename CacheTrait>
 PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
-  const auto& pool = allocator_->getPool(poolId);
+  const auto& pool = allocator_[currentTier()]->getPool(poolId);
   const auto& allocSizes = pool.getAllocSizes();
   auto mpStats = pool.getStats();
   const auto& classIds = mpStats.classIds;
@@ -2133,7 +2553,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
   // TODO export evictions, numItems etc from compact cache directly.
   if (!isCompactCache) {
     for (const ClassId cid : classIds) {
-      const auto& container = getMMContainer(poolId, cid);
+      const auto& container = getMMContainer(currentTier(), poolId, cid);
       uint64_t classHits = (*stats_.cacheHits)[poolId][cid].get();
       cacheStats.insert(
           {cid,
@@ -2149,7 +2569,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
 
   PoolStats ret;
   ret.isCompactCache = isCompactCache;
-  ret.poolName = allocator_->getPoolName(poolId);
+  ret.poolName = allocator_[currentTier()]->getPoolName(poolId);
   ret.poolSize = pool.getPoolSize();
   ret.poolUsableSize = pool.getPoolUsableSize();
   ret.poolAdvisedSize = pool.getPoolAdvisedSize();
@@ -2165,25 +2585,23 @@ template <typename CacheTrait>
 PoolEvictionAgeStats CacheAllocator<CacheTrait>::getPoolEvictionAgeStats(
     PoolId pid, unsigned int slabProjectionLength) const {
   PoolEvictionAgeStats stats;
-
-  const auto& pool = allocator_->getPool(pid);
+  const auto& pool = allocator_[currentTier()]->getPool(pid);
   const auto& allocSizes = pool.getAllocSizes();
   for (ClassId cid = 0; cid < static_cast<ClassId>(allocSizes.size()); ++cid) {
-    auto& mmContainer = getMMContainer(pid, cid);
+    auto& mmContainer = getMMContainer(currentTier(), pid, cid);
     const auto numItemsPerSlab =
-        allocator_->getPool(pid).getAllocationClass(cid).getAllocsPerSlab();
+        allocator_[currentTier()]->getPool(pid).getAllocationClass(cid).getAllocsPerSlab();
     const auto projectionLength = numItemsPerSlab * slabProjectionLength;
     stats.classEvictionAgeStats[cid] =
         mmContainer.getEvictionAgeStat(projectionLength);
   }
-
   return stats;
 }
 
 template <typename CacheTrait>
 CacheMetadata CacheAllocator<CacheTrait>::getCacheMetadata() const noexcept {
   return CacheMetadata{kCachelibVersion, kCacheRamFormatVersion,
-                       kCacheNvmFormatVersion, config_.size};
+                       kCacheNvmFormatVersion, config_.getCacheSize()};
 }
 
 template <typename CacheTrait>
@@ -2215,7 +2633,7 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
   }
 
   try {
-    auto releaseContext = allocator_->startSlabRelease(
+    auto releaseContext = allocator_[currentTier()]->startSlabRelease(
         pid, victim, receiver, mode, hint,
         [this]() -> bool { return shutDownInProgress_; });
 
@@ -2224,15 +2642,15 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
       return;
     }
 
-    releaseSlabImpl(releaseContext);
-    if (!allocator_->allAllocsFreed(releaseContext)) {
+    releaseSlabImpl(currentTier(), releaseContext);
+    if (!allocator_[currentTier()]->allAllocsFreed(releaseContext)) {
       throw std::runtime_error(
           folly::sformat("Was not able to free all allocs. PoolId: {}, AC: {}",
                          releaseContext.getPoolId(),
                          releaseContext.getClassId()));
     }
 
-    allocator_->completeSlabRelease(releaseContext);
+    allocator_[currentTier()]->completeSlabRelease(releaseContext);
   } catch (const exception::SlabReleaseAborted& e) {
     stats_.numAbortedSlabReleases.inc();
     throw exception::SlabReleaseAborted(folly::sformat(
@@ -2243,8 +2661,7 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
 }
 
 template <typename CacheTrait>
-SlabReleaseStats CacheAllocator<CacheTrait>::getSlabReleaseStats()
-    const noexcept {
+SlabReleaseStats CacheAllocator<CacheTrait>::getSlabReleaseStats() const noexcept {
   std::lock_guard<std::mutex> l(workersMutex_);
   return SlabReleaseStats{stats_.numActiveSlabReleases.get(),
                           stats_.numReleasedForRebalance.get(),
@@ -2261,7 +2678,7 @@ SlabReleaseStats CacheAllocator<CacheTrait>::getSlabReleaseStats()
 }
 
 template <typename CacheTrait>
-void CacheAllocator<CacheTrait>::releaseSlabImpl(
+void CacheAllocator<CacheTrait>::releaseSlabImpl(TierId tid,
     const SlabReleaseContext& releaseContext) {
   util::Throttler throttler(config_.throttleConfig);
 
@@ -2289,7 +2706,7 @@ void CacheAllocator<CacheTrait>::releaseSlabImpl(
     if (!isMoved) {
       evictForSlabRelease(releaseContext, item, throttler);
     }
-    XDCHECK(allocator_->isAllocFreed(releaseContext, alloc));
+    XDCHECK(allocator_[tid]->isAllocFreed(releaseContext, alloc));
   }
 }
 
@@ -2369,8 +2786,11 @@ bool CacheAllocator<CacheTrait>::moveForSlabRelease(
             ctx.getPoolId(), ctx.getClassId());
     });
   }
-  const auto allocInfo = allocator_->getAllocInfo(oldItem.getMemory());
-  allocator_->free(&oldItem);
+
+  auto tid = getTierId(oldItem);
+
+  const auto allocInfo = allocator_[tid]->getAllocInfo(oldItem.getMemory());
+  allocator_[tid]->free(&oldItem);
 
   (*stats_.fragmentationSize)[allocInfo.poolId][allocInfo.classId].sub(
       util::getFragmentation(*this, oldItem));
@@ -2432,11 +2852,12 @@ CacheAllocator<CacheTrait>::allocateNewItemForOldItem(const Item& oldItem) {
   }
 
   const auto allocInfo =
-      allocator_->getAllocInfo(static_cast<const void*>(&oldItem));
+      allocator_[getTierId(oldItem)]->getAllocInfo(static_cast<const void*>(&oldItem));
 
   // Set up the destination for the move. Since oldItem would have the moving
   // bit set, it won't be picked for eviction.
-  auto newItemHdl = allocateInternal(allocInfo.poolId,
+  auto newItemHdl = allocateInternalTier(getTierId(oldItem),
+                                     allocInfo.poolId,
                                      oldItem.getKey(),
                                      oldItem.getSize(),
                                      oldItem.getCreationTime(),
@@ -2521,7 +2942,7 @@ void CacheAllocator<CacheTrait>::evictForSlabRelease(
     // last handle for the owner.
     if (owningHandle) {
       const auto allocInfo =
-          allocator_->getAllocInfo(static_cast<const void*>(&item));
+          allocator_[getTierId(item)]->getAllocInfo(static_cast<const void*>(&item));
       if (owningHandle->hasChainedItem()) {
         (*stats_.chainedItemEvictions)[allocInfo.poolId][allocInfo.classId]
             .inc();
@@ -2548,7 +2969,7 @@ void CacheAllocator<CacheTrait>::evictForSlabRelease(
 
     if (shutDownInProgress_) {
       item.unmarkMoving();
-      allocator_->abortSlabRelease(ctx);
+      allocator_[getTierId(item)]->abortSlabRelease(ctx);
       throw exception::SlabReleaseAborted(
           folly::sformat("Slab Release aborted while trying to evict"
                          " Item: {} Pool: {}, Class: {}.",
@@ -2578,6 +2999,9 @@ CacheAllocator<CacheTrait>::evictNormalItemForSlabRelease(Item& item) {
   if (item.isOnlyMoving()) {
     return ItemHandle{};
   }
+
+  auto evictHandle = tryEvictToNextMemoryTier(&item);
+  if(evictHandle) return evictHandle;
 
   auto predicate = [](const Item& it) { return it.getRefCount() == 0; };
 
@@ -2730,6 +3154,7 @@ bool CacheAllocator<CacheTrait>::removeIfExpired(const ItemHandle& handle) {
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     const SlabReleaseContext& ctx, void* alloc, util::Throttler& throttler) {
+
   // MemoryAllocator::processAllocForRelease will execute the callback
   // if the item is not already free. So there are three outcomes here:
   //  1. Item not freed yet and marked as moving
@@ -2743,18 +3168,20 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
   // At first, we assume this item was already freed
   bool itemFreed = true;
   bool markedMoving = false;
-  const auto fn = [&markedMoving, &itemFreed](void* memory) {
+  TierId tid = 0;
+  const auto fn = [&markedMoving, &itemFreed, &tid, this /* TODO - necessary for getTierId */](void* memory) {
     // Since this callback is executed, the item is not yet freed
     itemFreed = false;
     Item* item = static_cast<Item*>(memory);
     if (item->markMoving()) {
       markedMoving = true;
     }
+    tid = getTierId(*item);
   };
 
   auto startTime = util::getCurrentTimeSec();
   while (true) {
-    allocator_->processAllocForRelease(ctx, alloc, fn);
+    allocator_[tid]->processAllocForRelease(ctx, alloc, fn);
 
     // If item is already freed we give up trying to mark the item moving
     // and return false, otherwise if marked as moving, we return true.
@@ -2770,7 +3197,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
 
     if (shutDownInProgress_) {
       XDCHECK(!static_cast<Item*>(alloc)->isMoving());
-      allocator_->abortSlabRelease(ctx);
+      allocator_[tid]->abortSlabRelease(ctx);
       throw exception::SlabReleaseAborted(
           folly::sformat("Slab Release aborted while still trying to mark"
                          " as moving for Item: {}. Pool: {}, Class: {}.",
@@ -2793,12 +3220,15 @@ template <typename CCacheT, typename... Args>
 CCacheT* CacheAllocator<CacheTrait>::addCompactCache(folly::StringPiece name,
                                                      size_t size,
                                                      Args&&... args) {
+  if (numTiers_ != 1)
+    throw std::runtime_error("TODO: compact cache for multi-tier Cache not supported.");
+
   if (!config_.isCompactCacheEnabled()) {
     throw std::logic_error("Compact cache is not enabled");
   }
 
   folly::SharedMutex::WriteHolder lock(compactCachePoolsLock_);
-  auto poolId = allocator_->addPool(name, size, {Slab::kSize});
+  auto poolId = allocator_[0]->addPool(name, size, {Slab::kSize});
   isCompactCachePool_[poolId] = true;
 
   auto ptr = std::make_unique<CCacheT>(
@@ -2870,7 +3300,6 @@ typename CacheTrait::MMType::LruType CacheAllocator<CacheTrait>::getItemLruType(
 // ---------------------------------
 // | accessContainer_              |
 // | mmContainers_                 |
-// | emptyMMContainers             |
 // | compactCacheManager_          |
 // | allocator_                    |
 // | metadata_                     |
@@ -2908,12 +3337,15 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
   *metadata_.numChainedChildItems_ref() = stats_.numChainedChildItems.get();
   *metadata_.numAbortedSlabReleases_ref() = stats_.numAbortedSlabReleases.get();
 
+  // TODO: implement serialization for multiple tiers
   auto serializeMMContainers = [](MMContainers& mmContainers) {
     MMSerializationTypeContainer state;
-    for (unsigned int i = 0; i < mmContainers.size(); ++i) {
+    for (unsigned int i = 0; i < 1 /* TODO: */ ; ++i) {
       for (unsigned int j = 0; j < mmContainers[i].size(); ++j) {
-        if (mmContainers[i][j]) {
-          state.pools_ref()[i][j] = mmContainers[i][j]->saveState();
+        for (unsigned int k = 0; k < mmContainers[i][j].size(); ++k) {
+          if (mmContainers[i][j][k]) {
+            state.pools_ref()[j][k] = mmContainers[i][j][k]->saveState();
+          }
         }
       }
     }
@@ -2922,15 +3354,9 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
   MMSerializationTypeContainer mmContainersState =
       serializeMMContainers(mmContainers_);
 
-  // On version 15, persist the empty unevictable mmcontainer.
-  // So that version <= 14 can still load a metadata saved by version 15.
-  // TODO: Remove this on version 16.
-  MMContainers dummyMMContainers = createEmptyMMContainers();
-  MMSerializationTypeContainer unevictableMMContainersState =
-      serializeMMContainers(dummyMMContainers);
-
   AccessSerializationType accessContainerState = accessContainer_->saveState();
-  MemoryAllocator::SerializationType allocatorState = allocator_->saveState();
+  // TODO: foreach allocator
+  MemoryAllocator::SerializationType allocatorState = allocator_[0]->saveState();
   CCacheManager::SerializationType ccState = compactCacheManager_->saveState();
 
   AccessSerializationType chainedItemAccessContainerState =
@@ -2943,7 +3369,6 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
   Serializer::serializeToIOBufQueue(queue, allocatorState);
   Serializer::serializeToIOBufQueue(queue, ccState);
   Serializer::serializeToIOBufQueue(queue, mmContainersState);
-  Serializer::serializeToIOBufQueue(queue, unevictableMMContainersState);
   Serializer::serializeToIOBufQueue(queue, accessContainerState);
   Serializer::serializeToIOBufQueue(queue, chainedItemAccessContainerState);
   return queue;
@@ -2993,6 +3418,8 @@ CacheAllocator<CacheTrait>::shutDown() {
       (shmShutDownStatus == ShmShutDownRes::kSuccess);
   shmManager_.reset();
 
+  // TODO: save per-tier state
+
   if (shmShutDownSucceeded) {
     if (!nvmShutDownStatusOpt || *nvmShutDownStatusOpt)
       return ShutDownStatus::kSuccess;
@@ -3030,7 +3457,7 @@ std::optional<bool> CacheAllocator<CacheTrait>::saveNvmCache() {
     return false;
   }
 
-  nvmCacheState_.markSafeShutDown();
+  nvmCacheState_.value().markSafeShutDown();
   return true;
 }
 
@@ -3041,8 +3468,11 @@ void CacheAllocator<CacheTrait>::saveRamCache() {
   std::unique_ptr<folly::IOBuf> ioBuf = serializedBuf.move();
   ioBuf->coalesce();
 
-  void* infoAddr =
-      shmManager_->createShm(detail::kShmInfoName, ioBuf->length()).addr;
+  ShmSegmentOpts opts;
+  opts.typeOpts = PosixSysVSegmentOpts(config_.isUsingPosixShm());
+
+  void* infoAddr = shmManager_->createShm(detail::kShmInfoName, ioBuf->length(),
+      nullptr, opts).addr;
   Serializer serializer(reinterpret_cast<uint8_t*>(infoAddr),
                         reinterpret_cast<uint8_t*>(infoAddr) + ioBuf->length());
   serializer.writeToBuffer(std::move(ioBuf));
@@ -3056,7 +3486,9 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
   const auto container =
       deserializer.deserialize<MMSerializationTypeContainer>();
 
-  MMContainers mmContainers;
+  /* TODO: right now, we create empty containers becouse deserialization
+   * only works for a single (topmost) tier. */
+  MMContainers mmContainers = createEmptyMMContainers();
 
   for (auto& kvPool : *container.pools_ref()) {
     auto i = static_cast<PoolId>(kvPool.first);
@@ -3071,11 +3503,11 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
                                 ? pool.getAllocationClass(j).getAllocsPerSlab()
                                 : 0);
       ptr->setConfig(config);
-      mmContainers[i][j] = std::move(ptr);
+      mmContainers[0 /* TODO */][i][j] = std::move(ptr);
     }
   }
   // We need to drop the unevictableMMContainer in the desierializer.
-  // TODO: remove this when all use case are later than version 15.
+  // TODO: remove this at version 17.
   if (metadata_.allocatorVersion_ref() <= 15) {
     deserializer.deserialize<MMSerializationTypeContainer>();
   }
@@ -3085,14 +3517,16 @@ CacheAllocator<CacheTrait>::deserializeMMContainers(
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::MMContainers
 CacheAllocator<CacheTrait>::createEmptyMMContainers() {
-  MMContainers mmContainers;
+  MMContainers mmContainers(numTiers_);
   for (unsigned int i = 0; i < mmContainers_.size(); i++) {
     for (unsigned int j = 0; j < mmContainers_[i].size(); j++) {
-      if (mmContainers_[i][j]) {
-        MMContainerPtr ptr =
-            std::make_unique<typename MMContainerPtr::element_type>(
-                mmContainers_[i][j]->getConfig(), compressor_);
-        mmContainers[i][j] = std::move(ptr);
+      for (unsigned int k = 0; k < mmContainers_[i][j].size(); k++) {
+        if (mmContainers_[i][j][k]) {
+          MMContainerPtr ptr =
+              std::make_unique<typename MMContainerPtr::element_type>(
+                  mmContainers_[i][j][k]->getConfig(), compressor_);
+          mmContainers[i][j][k] = std::move(ptr);
+        }
       }
     }
   }
@@ -3193,8 +3627,9 @@ CacheAllocator<CacheTrait>::findChainedItem(const Item& parent) const {
 }
 
 template <typename CacheTrait>
-typename CacheAllocator<CacheTrait>::ChainedAllocs
-CacheAllocator<CacheTrait>::viewAsChainedAllocs(const ItemHandle& parent) {
+template <typename Handle, typename Iter>
+CacheChainedAllocs<CacheAllocator<CacheTrait>, Handle, Iter>
+CacheAllocator<CacheTrait>::viewAsChainedAllocsT(const Handle& parent) {
   XDCHECK(parent);
   auto handle = parent.clone();
   if (!handle) {
@@ -3210,7 +3645,8 @@ CacheAllocator<CacheTrait>::viewAsChainedAllocs(const ItemHandle& parent) {
 
   auto l = chainedItemLocks_.lockShared(handle->getKey());
   auto head = findChainedItem(*handle);
-  return ChainedAllocs{std::move(l), std::move(handle), *head, compressor_};
+  return CacheChainedAllocs<CacheAllocator<CacheTrait>, Handle, Iter>{
+      std::move(l), std::move(handle), *head, compressor_};
 }
 
 template <typename CacheTrait>
@@ -3222,8 +3658,8 @@ GlobalCacheStats CacheAllocator<CacheTrait>::getGlobalCacheStats() const {
 
   const uint64_t currTime = util::getCurrentTimeSec();
   ret.ramUpTime = currTime - cacheCreationTime_;
-  ret.nvmUpTime = currTime - nvmCacheState_.getCreationTime();
   ret.nvmCacheEnabled = nvmCache_ ? nvmCache_->isEnabled() : false;
+  ret.nvmUpTime = currTime - getNVMCacheCreationTime();
   ret.reaperStats = getReaperStats();
   ret.numActiveHandles = getNumActiveHandles();
 
@@ -3232,10 +3668,13 @@ GlobalCacheStats CacheAllocator<CacheTrait>::getGlobalCacheStats() const {
 
 template <typename CacheTrait>
 CacheMemoryStats CacheAllocator<CacheTrait>::getCacheMemoryStats() const {
-  const auto totalCacheSize = allocator_->getMemorySize();
+  size_t totalCacheSize = 0;
+  for(auto& allocator: allocator_) {
+    totalCacheSize += allocator->getMemorySize();
+  }
 
   auto addSize = [this](size_t a, PoolId pid) {
-    return a + allocator_->getPool(pid).getPoolSize();
+    return a + allocator_[currentTier()]->getPool(pid).getPoolSize();
   };
   const auto regularPoolIds = getRegularPoolIds();
   const auto ccCachePoolIds = getCCachePoolIds();
@@ -3247,12 +3686,12 @@ CacheMemoryStats CacheAllocator<CacheTrait>::getCacheMemoryStats() const {
   return CacheMemoryStats{totalCacheSize,
                           regularCacheSize,
                           compactCacheSize,
-                          allocator_->getAdvisedMemorySize(),
+                          allocator_[currentTier()]->getAdvisedMemorySize(),
                           memMonitor_ ? memMonitor_->getMaxAdvisePct() : 0,
-                          allocator_->getUnreservedMemorySize(),
+                          allocator_[currentTier()]->getUnreservedMemorySize(),
                           nvmCache_ ? nvmCache_->getSize() : 0,
-                          memMonitor_ ? memMonitor_->getMemAvailableSize() : 0,
-                          memMonitor_ ? memMonitor_->getMemRssSize() : 0};
+                          util::getMemAvailable(),
+                          util::getRSSBytes()};
 }
 
 template <typename CacheTrait>
@@ -3386,12 +3825,14 @@ bool CacheAllocator<CacheTrait>::stopReaper(std::chrono::seconds timeout) {
 
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
-    const std::string& cacheDir, bool posix) {
+  const std::string& cacheDir, bool posix /*TODO(SHM_FILE): const std::vector<CacheMemoryTierConfig>& config */) {
   if (util::getStatIfExists(cacheDir, nullptr) && util::isDir(cacheDir)) {
     try {
       // cache dir exists. clean up only if there are no other processes
       // attached. if another process was attached, the following would fail.
       ShmManager::cleanup(cacheDir, posix);
+
+      // TODO: cleanup per-tier state
     } catch (const std::exception& e) {
       XLOGF(ERR, "Error cleaning up {}. Exception: ", cacheDir, e.what());
       return false;
@@ -3401,18 +3842,31 @@ bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
     // Any other concurrent process can not be attached to the segments or
     // even if it does, we want to mark it for destruction.
     ShmManager::removeByName(cacheDir, detail::kShmInfoName, posix);
-    ShmManager::removeByName(cacheDir, detail::kShmCacheName, posix);
+    ShmManager::removeByName(cacheDir, detail::kShmCacheName
+                             + std::to_string(0), posix);
     ShmManager::removeByName(cacheDir, detail::kShmHashTableName, posix);
     ShmManager::removeByName(cacheDir, detail::kShmChainedItemHashTableName,
                              posix);
+
+    // TODO(SHM_FILE): try to nuke segments of differente types (which require
+    // extra info)
+    // for (auto &tier : config) {
+    //   ShmManager::removeByName(cacheDir, tierShmName, config_.memoryTiers[i].opts);
+    // }
   }
   return true;
 }
 
 template <typename CacheTrait>
-uintptr_t CacheAllocator<CacheTrait>::getItemPtrAsOffset(const void* ptr) {
+uint64_t CacheAllocator<CacheTrait>::getItemPtrAsOffset(const void* ptr) {
+  // Return unt64_t instead of uintptr_t to accommodate platforms where
+  // the two differ (e.g. Mac OS 12) - causing templating instantiation
+  // errors downstream.
+
+  auto tid = getTierId(ptr);
+
   // if this succeeeds, the address is valid within the cache.
-  allocator_->getAllocInfo(ptr);
+  allocator_[tid]->getAllocInfo(ptr);
 
   if (!isOnShm_ || !shmManager_) {
     throw std::invalid_argument("Shared memory not used");
@@ -3420,8 +3874,8 @@ uintptr_t CacheAllocator<CacheTrait>::getItemPtrAsOffset(const void* ptr) {
 
   const auto& shm = shmManager_->getShmByName(detail::kShmCacheName);
 
-  return reinterpret_cast<uintptr_t>(ptr) -
-         reinterpret_cast<uintptr_t>(shm.getCurrentMapping().addr);
+  return reinterpret_cast<uint64_t>(ptr) -
+         reinterpret_cast<uint64_t>(shm.getCurrentMapping().addr);
 }
 
 template <typename CacheTrait>

@@ -65,6 +65,13 @@ target_link_libraries(cachelib_allocator PUBLIC
   cachelib_shm
   )
 
+if ((CMAKE_SYSTEM_NAME STREQUAL Linux) AND
+    (CMAKE_SYSTEM_PROCESSOR STREQUAL x86_64))
+else()
+  target_compile_definitions(cachelib_allocator PRIVATE SKIP_SIZE_VERIFY)
+endif()
+
+
 install(TARGETS cachelib_allocator
         EXPORT cachelib-exports
         DESTINATION ${LIB_INSTALL_DIR} )
@@ -74,6 +81,7 @@ if (BUILD_TESTS)
     ${DATASTRUCT_TESTS_THRIFT_FILES}
     ./nvmcache/tests/NvmTestBase.cpp
     ./memory/tests/TestBase.cpp
+    ../common/TestUtils.cpp
     )
   add_dependencies(allocator_test_support thrift_generated_files)
   target_link_libraries (allocator_test_support PUBLIC
@@ -109,6 +117,8 @@ if (BUILD_TESTS)
   add_test (tests/ChainedHashTest.cpp)
   add_test (tests/AllocatorResizeTypeTest.cpp)
   add_test (tests/AllocatorHitStatsTypeTest.cpp)
+  add_test (tests/AllocatorMemoryTiersTest.cpp)
+  add_test (tests/MemoryTiersTest.cpp)
   add_test (tests/MultiAllocatorTest.cpp)
   add_test (tests/NvmAdmissionPolicyTest.cpp)
   add_test (nvmcache/tests/NvmItemTests.cpp)
