@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright 2022, Intel Corporation
 
-git clone https://github.com/pmem/CacheLib CacheLib
+git clone https://github.com/chorig9/CacheLib-1 CacheLib
 cd CacheLib
 git checkout main
 cd ..
