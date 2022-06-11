@@ -1219,26 +1219,42 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
   // Keep searching for a candidate until we were able to evict it
   // or until the search limit has been exhausted
   unsigned int searchTries = 0;
-  auto itr = mmContainer.getEvictionIterator();
   while ((config_.evictionSearchTries == 0 ||
-          config_.evictionSearchTries > searchTries) &&
-         itr) {
+          config_.evictionSearchTries > searchTries)) {
     ++searchTries;
 
-    Item* toRecycle = itr.get();
+    Item* toRecycle = nullptr;
+    Item* candidate = nullptr;
 
-    Item* candidate =
-        toRecycle->isChainedItem()
-            ? &toRecycle->asChainedItem().getParentItem(compressor_)
-            : toRecycle;
+    // TODO:
+    if constexpr (std::is_same_v<MMContainer, MMLru>) {
+      mmContainer.withEvictionIterator([this, &candidate, &toRecycle, &searchTries](auto &&itr){
+        while ((config_.evictionSearchTries == 0 ||
+            config_.evictionSearchTries > searchTries) && itr) {
+          ++searchTries;
 
-    // make sure no other thead is evicting the item
-    if (candidate->getRefCount() != 0 || !candidate->markMoving()) {
-      ++itr;
-      continue;
+          auto *toRecycle_ = itr.get();
+          auto *candidate_ = toRecycle_->isChainedItem()
+              ? &toRecycle_->asChainedItem().getParentItem(compressor_)
+              : toRecycle_;
+
+          // make sure no other thead is evicting the item
+          if (candidate_->getRefCount() != 0 || !candidate_->markMoving()) {
+            ++itr;
+            continue;
+          }
+
+          toRecycle = toRecycle_;
+          candidate = candidate_;
+        }
+      });
     }
 
-    itr.destroy();
+    if (!toRecycle)
+      continue;
+
+    XDCHECK(toRecycle);
+    XDCHECK(candidate);
 
     // for chained items, the ownership of the parent can change. We try to
     // evict what we think as parent and see if the eviction of parent
@@ -1299,8 +1315,6 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
         return toRecycle;
       }
     }
-
-    itr.resetToBegin();
   }
   return nullptr;
 }
